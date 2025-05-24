@@ -1,3 +1,21 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Control-flow overview
+#
+# bot → GameState.legal_moves()
+#             ↘ is_valid_move()
+#                 ↘ Board.is_on_grid()
+#                 ↘ Board.get()
+#                 ↘ _violates_ko()
+#                      ↘ compares ._grid snapshots in linked history
+#             → bot picks Move
+# bot → GameState.apply_move()
+#             ↘ Board.place_stone()
+#                 · builds GoString
+#                 · merges with same-color neighbours
+#                 · removes captured opponent strings
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 import copy
 from dlgo.gotypes import Player, Point        # gotypes.py supplies these
 
@@ -138,3 +156,22 @@ class GameState:
         test_state = self.apply_move(move)
         return not test_state.board.get_go_string(move.point).num_liberties == 0 \
                and not self.does_move_violate_ko(self.next_player, move)
+
+
+    # put this just after is_valid_move()
+    # -----------------------------------
+    def legal_moves(self):
+        """Return a list of every legal move in the current position."""
+        moves = []
+        for r in range(1, self.board.num_rows + 1):
+            for c in range(1, self.board.num_cols + 1):
+                p = Point(r, c)
+                if self.board.get(p) is None:
+                    candidate = Move.play(p)
+                    if self.is_valid_move(candidate):
+                        moves.append(candidate)
+        moves.append(Move.pass_turn())   # pass is always legal
+        moves.append(Move.resign())      # resign is always legal
+        return moves                     # ←  DON’T forget this!
+
+
