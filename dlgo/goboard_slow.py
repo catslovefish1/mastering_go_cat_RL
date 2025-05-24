@@ -55,7 +55,13 @@ class GoString:
 
 # ────────── 3. Board ──────────
 class Board:
+
+    @property
+    def grid(self):
+        # could return a *copy* to make it read-only
+        return self._grid
     """Handles stone placement, capture, and liberty bookkeeping."""
+    
     def __init__(self, num_rows, num_cols):
         self.num_rows, self.num_cols = num_rows, num_cols
         self._grid = {}                       # Point → GoString
@@ -185,3 +191,18 @@ class GameState:
         moves.append(Move.pass_turn())   # pass is always legal
         moves.append(Move.resign())      # resign is always legal
         return moves
+
+
+    # ---------------------------------------------------------
+    # Simple outcome based on stone count
+    # ---------------------------------------------------------
+    def winner(self) -> Player | None:
+        if not self.is_over():
+            return None
+        black, white = 0, 0
+        for p, color in self.board._grid.items():
+            if color == Player.black:
+                black += 1
+            elif color == Player.white:
+                white += 1
+        return Player.black if black > white else Player.white

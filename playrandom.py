@@ -1,9 +1,9 @@
 from dlgo.gotypes    import Player
 from dlgo.goboard_slow import GameState, Move
-from dlgo.random_bot import RandomBot
+from dlgo.agents.random_bot import RandomBot
 from dlgo.ascii_board import show
 
-BOARD_SIZE = 5
+BOARD_SIZE = 6
 bots   = {Player.black: RandomBot(), Player.white: RandomBot()}
 state  = GameState.new_game(BOARD_SIZE)
 move_no = 1
@@ -21,4 +21,3 @@ while not state.is_over():                # ← only condition you need
     move_no += 1
 
 print("Game over!")
-print(f'{state.next_player.name:5s} wins!')
