@@ -1,20 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Control-flow overview
-#
-# bot → GameState.legal_moves()
-#             ↘ is_valid_move()
-#                 ↘ Board.is_on_grid()
-#                 ↘ Board.get()
-#                 ↘ _violates_ko()
-#                      ↘ compares ._grid snapshots in linked history
-#             → bot picks Move
-# bot → GameState.apply_move()
-#             ↘ Board.place_stone()
-#                 · builds GoString
-#                 · merges with same-color neighbours
-#                 · removes captured opponent strings
+# Minimal Go engine – ko-safe version
+# (drop-in replacement for goboard_slow.py or goboard_basic.py)
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 import copy
 from dlgo.gotypes import Player, Point        # gotypes.py supplies these
@@ -38,7 +25,7 @@ class Move:
 
 # ────────── 2. GoString ──────────
 class GoString:
-    """A chain of same-colored stones plus its current liberties."""
+    """A chain of same-coloured stones plus its current liberties."""
     def __init__(self, color, stones, liberties):
         self.color      = color
         self.stones     = set(stones)
@@ -49,12 +36,22 @@ class GoString:
 
     def merged_with(self, other):
         assert other.color == self.color
-        combined = self.stones | other.stones
-        liberties = (self.liberties | other.liberties) - combined
+        combined   = self.stones | other.stones
+        liberties  = (self.liberties | other.liberties) - combined
         return GoString(self.color, combined, liberties)
 
     @property
     def num_liberties(self): return len(self.liberties)
+
+    # ── NEW: allow structural equality so board snapshots compare cleanly ──
+    def __eq__(self, other):
+        return (isinstance(other, GoString) and
+                self.color     == other.color and
+                self.stones    == other.stones and
+                self.liberties == other.liberties)
+
+    def __hash__(self):
+        return hash((self.color, frozenset(self.stones), frozenset(self.liberties)))
 
 # ────────── 3. Board ──────────
 class Board:
@@ -98,13 +95,23 @@ class Board:
                 self._remove_string(other_string)
 
     def _remove_string(self, string):
-        """Delete captured string and give liberties back to its neighbors."""
+        """Delete captured string and give liberties back to its neighbours."""
         for pt in string.stones:
             for n in pt.neighbors():
                 n_string = self._grid.get(n)
                 if n_string is None or n_string is string: continue
                 n_string.add_liberty(pt)
             del self._grid[pt]
+
+    # ── NEW: structural equality so ko test can compare boards directly ──
+    def __eq__(self, other):
+        return (isinstance(other, Board) and
+                self.num_rows == other.num_rows and
+                self.num_cols == other.num_cols and
+                self._grid    == other._grid)
+
+    def __hash__(self):
+        return hash((self.num_rows, self.num_cols, frozenset(self._grid.items())))
 
 # ────────── 4. GameState ──────────
 class GameState:
@@ -137,28 +144,33 @@ class GameState:
         return (self.last_move.is_resign or
                 (self.last_move.is_pass and second_last and second_last.is_pass))
 
+    # ── FIXED: compare (player.other, next_board) against history ──
     def does_move_violate_ko(self, player, move):
-        if not move.is_play: return False
-        next_state = self.apply_move(move)      # deep copy path
-        past_state = self
+        if not move.is_play:
+            return False
+        next_board = copy.deepcopy(self.board)
+        next_board.place_stone(player, move.point)
+
+        past_state = self.previous_state          # start one step back
         while past_state is not None:
-            if past_state.board._grid == next_state.board._grid:
+            if (past_state.next_player == player.other and
+                    past_state.board == next_board):
                 return True
             past_state = past_state.previous_state
         return False
 
     def is_valid_move(self, move):
-        if self.is_over():             return False
-        if move.is_pass or move.is_resign:  return True
-        if not self.board.is_on_grid(move.point): return False
-        if self.board.get(move.point) is not None: return False
+        if self.is_over():                             return False
+        if move.is_pass or move.is_resign:             return True
+        if not self.board.is_on_grid(move.point):      return False
+        if self.board.get(move.point) is not None:     return False
+
         # self-capture
         test_state = self.apply_move(move)
-        return not test_state.board.get_go_string(move.point).num_liberties == 0 \
-               and not self.does_move_violate_ko(self.next_player, move)
+        suicide = test_state.board.get_go_string(move.point).num_liberties == 0
+        return (not suicide and
+                not self.does_move_violate_ko(self.next_player, move))
 
-
-    # put this just after is_valid_move()
     # -----------------------------------
     def legal_moves(self):
         """Return a list of every legal move in the current position."""
@@ -172,6 +184,4 @@ class GameState:
                         moves.append(candidate)
         moves.append(Move.pass_turn())   # pass is always legal
         moves.append(Move.resign())      # resign is always legal
-        return moves                     # ←  DON’T forget this!
-
-
+        return moves
