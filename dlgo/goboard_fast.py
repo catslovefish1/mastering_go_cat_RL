@@ -1,319 +1,224 @@
-"""goboard_fast.py – Go board + game state with copy‑on‑write boards and
-constant‑time ko detection (Zobrist hashing).  No `deepcopy`, so it stays
-fast even over hundreds of games.
-
-Drop this file in **dlgo/goboard_fast.py** (or adjust your imports) and the
-rest of the codebase will work unchanged.
-"""
+# ko-safe Go engine – Zobrist + live (2,H,W) tensor on MPS/CPU
 from __future__ import annotations
+import os, secrets
+import torch
+from dlgo.gotypes import Player, Point
 
-import itertools
-import random
-from typing import Dict, List, Optional, Set
+DEVICE = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-from dlgo.gotypes import Player, Point  # external helper types
+MAX_BOARD = 19
+_Z_KEYS = [[[secrets.randbits(64) for _ in range(2)]
+            for _ in range(MAX_BOARD + 1)]
+            for _ in range(MAX_BOARD + 1)]
+_TURN_KEY = {Player.black: secrets.randbits(64),
+             Player.white: secrets.randbits(64)}
 
-# ────────────────────────────────────────────────────────────────
-#  Zobrist initialisation – one lazily‑filled table per board size
-# ────────────────────────────────────────────────────────────────
-_ZOBRIST_CACHE: Dict[tuple[int, int], Dict[tuple[int, int, Player], int]] = {}
-_SIDE_TOKEN_CACHE: Dict[tuple[int, int], Dict[Player, int]] = {}
-
-
-def _init_zobrist(num_rows: int, num_cols: int):
-    """Return (table, side_token) cached for this board size."""
-    key = (num_rows, num_cols)
-    if key in _ZOBRIST_CACHE:
-        return _ZOBRIST_CACHE[key], _SIDE_TOKEN_CACHE[key]
-
-    rng = random.Random(0xC0FFEE)  # determinism for unit tests
-    table = {(r, c, color): rng.getrandbits(64)
-             for r, c, color in itertools.product(
-                 range(1, num_rows + 1),
-                 range(1, num_cols + 1),
-                 (Player.black, Player.white))}
-    side_token = {Player.black: rng.getrandbits(64),
-                  Player.white: rng.getrandbits(64)}
-
-    _ZOBRIST_CACHE[key] = table
-    _SIDE_TOKEN_CACHE[key] = side_token
-    return table, side_token
-
-
-# ────────── 1. Move ──────────
+# ── Move ────────────────────────────────────────────────────────────
 class Move:
-    """Any action a player can take: play, pass, or resign."""
-    __slots__ = ("point", "is_play", "is_pass", "is_resign")
-
-    def __init__(self, point: Optional[Point] = None, *,
-                 is_pass: bool = False, is_resign: bool = False):
-        assert (point is not None) ^ is_pass ^ is_resign
+    def __init__(self, point: Point | None = None, *, is_pass: bool = False):
+        assert (point is not None) ^ is_pass  # exactly one must be true
         self.point = point
         self.is_play = point is not None
         self.is_pass = is_pass
-        self.is_resign = is_resign
 
     @classmethod
-    def play(cls, point: Point) -> "Move":
-        return cls(point=point)
+    def play(cls, p: Point):
+        return Move(point=p)
 
     @classmethod
-    def pass_turn(cls) -> "Move":
-        return cls(is_pass=True)
-
-    @classmethod
-    def resign(cls) -> "Move":
-        return cls(is_resign=True)
-
-    # readable repr for debugging / tests
-    def __repr__(self):
-        if self.is_play:
-            return f"Move.play({self.point})"
-        if self.is_pass:
-            return "Move.pass"
-        return "Move.resign"
+    def pass_turn(cls):
+        return Move(is_pass=True)
 
 
-# ────────── 2. GoString ──────────
+# ── GoString ────────────────────────────────────────────────────────
 class GoString:
-    """A chain of same‑coloured stones plus its current liberties."""
-    __slots__ = ("color", "stones", "liberties")
-
-    def __init__(self, color: Player, stones: Set[Point],
-                 liberties: Set[Point]):
-        self.color = color
+    def __init__(self, colour: Player, stones, libs):
+        self.color = colour
         self.stones = set(stones)
-        self.liberties = set(liberties)
+        self.liberties = set(libs)
 
-    def remove_liberty(self, pt: Point):
-        self.liberties.discard(pt)
+    def remove_liberty(self, p: Point):
+        self.liberties.discard(p)
 
-    def add_liberty(self, pt: Point):
-        self.liberties.add(pt)
+    def add_liberty(self, p: Point):
+        self.liberties.add(p)
 
-    def merged_with(self, other: "GoString") -> "GoString":
+    def merged_with(self, other):
         assert other.color == self.color
-        combined = self.stones | other.stones
-        liberties = (self.liberties | other.liberties) - combined
-        return GoString(self.color, combined, liberties)
+        return GoString(
+            self.color,
+            self.stones | other.stones,
+            (self.liberties | other.liberties) - (self.stones | other.stones),
+        )
 
     @property
-    def num_liberties(self) -> int:
+    def num_liberties(self):
         return len(self.liberties)
 
-    # structural equality for regression tests
-    def __eq__(self, other):
-        return (isinstance(other, GoString) and
-                self.color == other.color and
-                self.stones == other.stones and
-                self.liberties == other.liberties)
+    def __eq__(self, o):
+        return (
+            isinstance(o, GoString)
+            and self.color == o.color
+            and self.stones == o.stones
+            and self.liberties == o.liberties
+        )
 
-    def __hash__(self):  # for use as dict key
-        return hash((self.color, frozenset(self.stones),
-                     frozenset(self.liberties)))
+    def __hash__(self):
+        return hash((self.color, frozenset(self.stones), frozenset(self.liberties)))
 
 
-# ────────── 3. Board ──────────
+# ── Board ───────────────────────────────────────────────────────────
 class Board:
-    """Handles placement, capture, liberty bookkeeping – plus an incremental hash."""
+    def __init__(self, rows: int, cols: int):
+        self.num_rows = rows
+        self.num_cols = cols
+        self._grid: dict[Point, GoString] = {}
+        self._hash = 0
+        self._tensor = torch.zeros((2, rows, cols), dtype=torch.uint8, device=DEVICE)
 
-    __slots__ = ("num_rows", "num_cols", "_grid", "_zobrist_table",
-                 "_side_token", "_hash")
+    # ----- helpers -----
+    def is_on_grid(self, p: Point):
+        return 1 <= p.row <= self.num_rows and 1 <= p.col <= self.num_cols
 
-    def __init__(self, num_rows: int, num_cols: int):
-        self.num_rows, self.num_cols = num_rows, num_cols
-        self._grid: Dict[Point, GoString] = {}
-        self._zobrist_table, self._side_token = _init_zobrist(num_rows,
-                                                              num_cols)
-        self._hash: int = 0  # 64‑bit incremental hash of the board position
+    def get(self, p: Point):
+        return self._grid.get(p).color if p in self._grid else None
 
-    # ── helpers ────────────────────────────────────────────────
-    def is_on_grid(self, pt: Point) -> bool:
-        return 1 <= pt.row <= self.num_rows and 1 <= pt.col <= self.num_cols
+    def get_go_string(self, p: Point):
+        return self._grid.get(p)
 
-    def get(self, pt: Point) -> Optional[Player]:
-        string = self._grid.get(pt)
-        return string.color if string else None
+    # ----- safe deep-copy (re‑instantiates every GoString) -----
+    def copy(self):  # ← patched deep copy
+        new = Board(self.num_rows, self.num_cols)
 
-    def get_go_string(self, pt: Point) -> Optional[GoString]:
-        return self._grid.get(pt)
+        gs_map: dict[GoString, GoString] = {}
+        for pt, gs in self._grid.items():
+            if gs not in gs_map:
+                gs_map[gs] = GoString(gs.color, gs.stones.copy(), gs.liberties.copy())
+            new._grid[pt] = gs_map[gs]
 
-    @property
-    def zobrist(self) -> int:
-        return self._hash
+        new._hash = self._hash
+        new._tensor = self._tensor.clone().detach()  # break autograd graph / MPS cache
+        return new
 
-    # ── main action ────────────────────────────────────────────
+    # ----- core play -----
     def place_stone(self, player: Player, point: Point):
-        """Mutates the board in‑place *and* keeps the Zobrist hash in sync."""
-        assert self.is_on_grid(point), "Point off board"
-        assert point not in self._grid, "Point already occupied"
+        assert self.is_on_grid(point) and self._grid.get(point) is None
 
-        adjacent_same: List[GoString] = []
-        adjacent_opposite: List[GoString] = []
-        liberties: List[Point] = []
-
+        adj_same, adj_opp, libs = [], [], []
         for n in point.neighbors():
             if not self.is_on_grid(n):
                 continue
-            string = self._grid.get(n)
-            if string is None:
-                liberties.append(n)
-            elif string.color == player:
-                if string not in adjacent_same:
-                    adjacent_same.append(string)
-            else:  # opponent
-                if string not in adjacent_opposite:
-                    adjacent_opposite.append(string)
+            s = self._grid.get(n)
+            if s is None:
+                libs.append(n)
+            elif s.color == player and s not in adj_same:
+                adj_same.append(s)
+            elif s.color != player and s not in adj_opp:
+                adj_opp.append(s)
 
-        new_string = GoString(player, {point}, set(liberties))
-        for same_string in adjacent_same:
-            new_string = new_string.merged_with(same_string)
-        for s_pt in new_string.stones:
-            self._grid[s_pt] = new_string
-            self._hash ^= self._zobrist_table[(s_pt.row, s_pt.col, player)]
+        # Zobrist + tensor bookkeeping
+        self._hash ^= _Z_KEYS[point.row][point.col][player.value]
+        self._tensor[player.value, point.row - 1, point.col - 1] = 1
 
-        for other in adjacent_opposite:
+        new_str = GoString(player, [point], libs)
+        for s in adj_same:
+            new_str = new_str.merged_with(s)
+        for pnt in new_str.stones:
+            self._grid[pnt] = new_str
+
+        for other in adj_opp:
             other.remove_liberty(point)
-        for other in adjacent_opposite:
+        for other in adj_opp:
             if other.num_liberties == 0:
                 self._remove_string(other)
 
     def _remove_string(self, string: GoString):
-        """Delete captured stones and restore liberties to neighbours."""
         for pt in string.stones:
-            self._hash ^= self._zobrist_table[(pt.row, pt.col, string.color)]
-            del self._grid[pt]
             for n in pt.neighbors():
-                n_string = self._grid.get(n)
-                if n_string and n_string is not string:
-                    n_string.add_liberty(pt)
+                s = self._grid.get(n)
+                if s and s is not string:
+                    s.add_liberty(pt)
+            # update tensor and hash
+            self._tensor[string.color.value, pt.row - 1, pt.col - 1] = 0
+            self._hash ^= _Z_KEYS[pt.row][pt.col][string.color.value]
+            del self._grid[pt]
 
-    # ── cheap structural copy (no deepcopy!) ───────────────────
-    def copy(self) -> "Board":
-        """Return a board that shares *no mutable state* with this one but
-        reuses the (immutable) Zobrist tables.  O(number of strings)."""
-        new_board = Board(self.num_rows, self.num_cols)
-        new_board._zobrist_table = self._zobrist_table  # share read‑only data
-        new_board._side_token = self._side_token
-        new_board._hash = self._hash
+    # ----- accessors -----
+    @property
+    def zobrist(self):
+        return self._hash
 
-        # Clone each GoString once and re‑wire grid references.
-        clone: Dict[GoString, GoString] = {}
-        for pt, string in self._grid.items():
-            if string not in clone:
-                clone[string] = GoString(string.color,
-                                         string.stones.copy(),
-                                         string.liberties.copy())
-            new_board._grid[pt] = clone[string]
-        return new_board
-
-    # ── equality helpers (useful only in tests) ────────────────
-    def __eq__(self, other):
-        return (isinstance(other, Board) and
-                self.num_rows == other.num_rows and
-                self.num_cols == other.num_cols and
-                self._grid == other._grid)
-
-    def __hash__(self):
-        return hash((self.num_rows, self.num_cols,
-                     frozenset(self._grid.items())))
+    @property
+    def tensor(self):
+        return self._tensor  # (2,H,W) uint8
 
 
-# ────────── 4. GameState ──────────
+# ── GameState ───────────────────────────────────────────────────────
 class GameState:
-    """Immutable game node: (board, side‑to‑play, ko‑hash history)."""
-    __slots__ = ("board", "next_player", "previous_state", "last_move",
-                 "situation_hash", "hash_history")
-
-    def __init__(self, board: Board, next_player: Player,
-                 previous: Optional["GameState"], move: Optional[Move],
-                 situation_hash: int, hash_history: Set[int]):
+    def __init__(self, board: Board, next_player: Player, prev, move, pos_hash):
         self.board = board
         self.next_player = next_player
-        self.previous_state = previous
+        self.previous_state = prev
         self.last_move = move
-        self.situation_hash = situation_hash  # board hash ⊕ side token
-        self.hash_history = hash_history
+        self.pos_hash = pos_hash
 
-    # ── factory ────────────────────────────────────────────────
-    @classmethod
-    def new_game(cls, board_size: int | tuple[int, int]):
-        if isinstance(board_size, int):
-            board_size = (board_size, board_size)
-        board = Board(*board_size)
-        _, side_token = _init_zobrist(*board_size)
-        sit_hash = board.zobrist ^ side_token[Player.black]
-        return cls(board, Player.black, None, None, sit_hash, {sit_hash})
-
-    # ── move play ──────────────────────────────────────────────
-    def apply_move(self, move: Move) -> "GameState":
+    def apply_move(self, move: Move):
+        nb = self.board.copy()
         if move.is_play:
-            next_board = self.board.copy()
-            next_board.place_stone(self.next_player, move.point)  # mutates copy
-        else:
-            next_board = self.board  # pass / resign carries board forward
+            nb.place_stone(self.next_player, move.point)
+        nh = nb.zobrist ^ _TURN_KEY[self.next_player.other]
+        return GameState(nb, self.next_player.other, self, move, nh)
 
-        side_token = next_board._side_token
-        next_hash = next_board.zobrist ^ side_token[self.next_player.other]
+    @classmethod
+    def new_game(cls, size):
+        if isinstance(size, int):
+            size = (size, size)
+        b = Board(*size)
+        return GameState(b, Player.black, None, None, b.zobrist ^ _TURN_KEY[Player.black])
 
-        # We can share the same set object safely – it only ever *grows*.
-        self.hash_history.add(next_hash)
-
-        return GameState(next_board,
-                         self.next_player.other,
-                         self, move,
-                         next_hash,
-                         self.hash_history)
-
-    # ── game end & legality helpers ────────────────────────────
-    def is_over(self) -> bool:
+    # ----- game‑end -----
+    def is_over(self):
         if self.last_move is None:
             return False
-        second_last = (self.previous_state.last_move
-                        if self.previous_state else None)
-        return (self.last_move.is_resign or
-                (self.last_move.is_pass and second_last and second_last.is_pass))
+        prev = self.previous_state.last_move if self.previous_state else None
+        return self.last_move.is_pass and prev and prev.is_pass
 
-    def does_move_violate_ko(self, player: Player, move: Move) -> bool:
-        if not move.is_play:
+    # ----- ko / legality helpers -----
+    def _hash_after(self, pl: Player, pt: Point):
+        b = self.board.copy()
+        b.place_stone(pl, pt)
+        return b.zobrist ^ _TURN_KEY[pl.other]
+
+    def does_move_violate_ko(self, pl: Player, mv: Move):
+        if not mv.is_play:
             return False
-        table, token = self.board._zobrist_table, self.board._side_token
-        next_hash = (self.board.zobrist ^
-                     table[(move.point.row, move.point.col, player)] ^
-                     token[player.other])
-        return next_hash in self.hash_history
+        h = self._hash_after(pl, mv.point)
+        st = self.previous_state
+        while st:
+            if st.pos_hash == h:
+                return True
+            st = st.previous_state
+        return False
 
-    def _would_be_self_capture(self, player: Player, point: Point) -> bool:
-        board = self.board
-        # free liberty adjacent?
-        if any(board.is_on_grid(n) and board.get(n) is None
-               for n in point.neighbors()):
-            return False
-        # capture adjacent enemy string?
-        for n in point.neighbors():
-            string = board.get_go_string(n)
-            if string and string.color != player and string.num_liberties == 1:
-                return False
-        return True
-
-    def is_valid_move(self, move: Move) -> bool:
+    def is_valid_move(self, mv: Move):
         if self.is_over():
             return False
-        if move.is_pass or move.is_resign:
+        if mv.is_pass:
             return True
-        if not self.board.is_on_grid(move.point):
+        if not self.board.is_on_grid(mv.point):
             return False
-        if self.board.get(move.point) is not None:
+        if self.board.get(mv.point) is not None:
             return False
-        if self._would_be_self_capture(self.next_player, move.point):
+        b = self.board.copy()
+        b.place_stone(self.next_player, mv.point)
+        # self‑capture check
+        if b.get_go_string(mv.point).num_liberties == 0:
             return False
-        if self.does_move_violate_ko(self.next_player, move):
-            return False
-        return True
+        return not self.does_move_violate_ko(self.next_player, mv)
 
-    # ── shortcuts for agents ───────────────────────────────────
-    def legal_moves(self) -> List[Move]:
-        moves: List[Move] = []
+    def legal_moves(self):
+        moves = []
         for r in range(1, self.board.num_rows + 1):
             for c in range(1, self.board.num_cols + 1):
                 p = Point(r, c)
@@ -321,17 +226,23 @@ class GameState:
                     m = Move.play(p)
                     if self.is_valid_move(m):
                         moves.append(m)
-        moves.append(Move.pass_turn())
-        moves.append(Move.resign())
+        moves.append(Move.pass_turn())  # pass is always legal
         return moves
 
-    def winner(self) -> Optional[Player]:
+    # ----- tensor helper -----
+    def as_tensor(self):
+        return self.board.tensor  # (2,H,W) uint8
+
+    # ----- toy result (stone count only) -----
+    def final_result(self):
         if not self.is_over():
             return None
-        black, white = 0, 0
-        for string in self.board._grid.values():
-            if string.color == Player.black:
-                black += len(string.stones)
-            else:
-                white += len(string.stones)
-        return Player.black if black > white else Player.white
+        b = sum(1 for p in self.board._grid if self.board.get(p) == Player.black)
+        w = len(self.board._grid) - b
+        if b > w:
+            winner = Player.black
+        elif w > b:
+            winner = Player.white
+        else:
+            winner = None
+        return winner, b, w
