@@ -3,7 +3,7 @@ from dlgo.goboard_slow import GameState, Move
 from dlgo.agents.random_bot import RandomBot
 from dlgo.ascii_board import show
 
-BOARD_SIZE = 6
+BOARD_SIZE = 3
 bots   = {Player.black: RandomBot(), Player.white: RandomBot()}
 state  = GameState.new_game(BOARD_SIZE)
 move_no = 1

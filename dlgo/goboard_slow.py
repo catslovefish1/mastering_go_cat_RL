@@ -188,15 +188,19 @@ class GameState:
 
 
     # ---------------------------------------------------------
-    # Simple outcome based on stone count
+    # Simple outcome based on stone count   ← only this part changes
     # ---------------------------------------------------------
     def winner(self) -> Player | None:
         if not self.is_over():
             return None
-        black, white = 0, 0
-        for p, color in self.board._grid.items():
-            if color == Player.black:
+
+        black = white = 0
+        # _grid maps Point ➜ GoString, but we only need the colour
+        for pt in self.board._grid:          # visit each occupied intersection once
+            colour = self.board.get(pt)      # returns Player.black / Player.white
+            if colour == Player.black:
                 black += 1
-            elif color == Player.white:
-                white += 1
+            else:
+                white += 1                   # only two colours exist
+
         return Player.black if black > white else Player.white
