@@ -1,49 +1,45 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Minimal Go engine – ko-safe version
-# (drop-in replacement for goboard_slow.py or goboard_basic.py)
+# Minimal Go engine – ko-safe version (no resignation, ends after two passes)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import copy
-from dlgo.gotypes import Player, Point        # gotypes.py supplies these
+from dlgo.gotypes import Player, Point
 
 # ────────── 1. Move ──────────
 class Move:
-    """Any action a player can take: play, pass, or resign."""
-    def __init__(self, point=None, is_pass=False, is_resign=False):
-        assert (point is not None) ^ is_pass ^ is_resign    # exactly one
-        self.point     = point
-        self.is_play   = point is not None
-        self.is_pass   = is_pass
-        self.is_resign = is_resign
+    """Any action a player can take: play a stone or pass."""
+    def __init__(self, point=None, is_pass=False):
+        assert (point is not None) ^ is_pass          # exactly one
+        self.point    = point
+        self.is_play  = point is not None
+        self.is_pass  = is_pass
 
     @classmethod
-    def play(cls, point):      return Move(point=point)
+    def play(cls, point):   return Move(point=point)
     @classmethod
-    def pass_turn(cls):        return Move(is_pass=True)
-    @classmethod
-    def resign(cls):           return Move(is_resign=True)
+    def pass_turn(cls):     return Move(is_pass=True)
 
 # ────────── 2. GoString ──────────
 class GoString:
     """A chain of same-coloured stones plus its current liberties."""
     def __init__(self, color, stones, liberties):
-        self.color      = color
-        self.stones     = set(stones)
-        self.liberties  = set(liberties)
+        self.color     = color
+        self.stones    = set(stones)
+        self.liberties = set(liberties)
 
     def remove_liberty(self, pt): self.liberties.discard(pt)
     def add_liberty(self, pt):    self.liberties.add(pt)
 
     def merged_with(self, other):
         assert other.color == self.color
-        combined   = self.stones | other.stones
-        liberties  = (self.liberties | other.liberties) - combined
+        combined  = self.stones | other.stones
+        liberties = (self.liberties | other.liberties) - combined
         return GoString(self.color, combined, liberties)
 
     @property
     def num_liberties(self): return len(self.liberties)
 
-    # ── NEW: allow structural equality so board snapshots compare cleanly ──
+    # structural equality for ko checks
     def __eq__(self, other):
         return (isinstance(other, GoString) and
                 self.color     == other.color and
@@ -51,14 +47,16 @@ class GoString:
                 self.liberties == other.liberties)
 
     def __hash__(self):
-        return hash((self.color, frozenset(self.stones), frozenset(self.liberties)))
+        return hash((self.color,
+                     frozenset(self.stones),
+                     frozenset(self.liberties)))
 
 # ────────── 3. Board ──────────
 class Board:
     """Handles stone placement, capture, and liberty bookkeeping."""
     def __init__(self, num_rows, num_cols):
         self.num_rows, self.num_cols = num_rows, num_cols
-        self._grid = {}                       # Point → GoString
+        self._grid = {}                           # Point → GoString
 
     # helpers ---------------------------------------------------------
     def is_on_grid(self, pt): return 1 <= pt.row <= self.num_rows and 1 <= pt.col <= self.num_cols
@@ -103,7 +101,7 @@ class Board:
                 n_string.add_liberty(pt)
             del self._grid[pt]
 
-    # ── NEW: structural equality so ko test can compare boards directly ──
+    # structural equality for ko checks
     def __eq__(self, other):
         return (isinstance(other, Board) and
                 self.num_rows == other.num_rows and
@@ -111,16 +109,18 @@ class Board:
                 self._grid    == other._grid)
 
     def __hash__(self):
-        return hash((self.num_rows, self.num_cols, frozenset(self._grid.items())))
+        return hash((self.num_rows,
+                     self.num_cols,
+                     frozenset(self._grid.items())))
 
 # ────────── 4. GameState ──────────
 class GameState:
     """Board + turn + history; knows how to create the next state."""
     def __init__(self, board, next_player, previous, move):
-        self.board           = board
-        self.next_player     = next_player
-        self.previous_state  = previous
-        self.last_move       = move
+        self.board          = board
+        self.next_player    = next_player
+        self.previous_state = previous
+        self.last_move      = move
 
     def apply_move(self, move):
         if move.is_play:
@@ -139,19 +139,22 @@ class GameState:
 
     # ---------- game-end / legality helpers ----------
     def is_over(self):
-        if self.last_move is None: return False
+        """The game ends after two consecutive passes."""
+        if self.last_move is None:
+            return False
         second_last = self.previous_state.last_move if self.previous_state else None
-        return (self.last_move.is_resign or
-                (self.last_move.is_pass and second_last and second_last.is_pass))
+        return (self.last_move.is_pass and
+                second_last is not None and
+                second_last.is_pass)
 
-    # ── FIXED: compare (player.other, next_board) against history ──
+    # ko check --------------------------------------------------------
     def does_move_violate_ko(self, player, move):
         if not move.is_play:
             return False
         next_board = copy.deepcopy(self.board)
         next_board.place_stone(player, move.point)
 
-        past_state = self.previous_state          # start one step back
+        past_state = self.previous_state
         while past_state is not None:
             if (past_state.next_player == player.other and
                     past_state.board == next_board):
@@ -160,10 +163,10 @@ class GameState:
         return False
 
     def is_valid_move(self, move):
-        if self.is_over():                             return False
-        if move.is_pass or move.is_resign:             return True
-        if not self.board.is_on_grid(move.point):      return False
-        if self.board.get(move.point) is not None:     return False
+        if self.is_over():                        return False
+        if move.is_pass:                          return True
+        if not self.board.is_on_grid(move.point): return False
+        if self.board.get(move.point) is not None: return False
 
         # self-capture
         test_state = self.apply_move(move)
@@ -182,25 +185,31 @@ class GameState:
                     candidate = Move.play(p)
                     if self.is_valid_move(candidate):
                         moves.append(candidate)
-        moves.append(Move.pass_turn())   # pass is always legal
-        # moves.append(Move.resign())      # resign is always legal
+        moves.append(Move.pass_turn())            # pass is always legal
         return moves
 
+    # ---------------------------------------------------------
+    # Extremely simple scoring: stone count only
+    #  End-of-game bookkeeping
+    # ---------------------------------------------------------
+    def final_result(self):
+        """
+        Return a tuple (winner, black_count, white_count).
 
-    # ---------------------------------------------------------
-    # Simple outcome based on stone count   ← only this part changes
-    # ---------------------------------------------------------
-    def winner(self) -> Player | None:
+        • winner is Player.black / Player.white / None (draw)
+        • black_count, white_count are the stone totals at game end
+        """
         if not self.is_over():
-            return None
+            return None          # game not finished yet
 
         black = white = 0
-        # _grid maps Point ➜ GoString, but we only need the colour
-        for pt in self.board._grid:          # visit each occupied intersection once
-            colour = self.board.get(pt)      # returns Player.black / Player.white
-            if colour == Player.black:
+        for pt in self.board._grid:
+            if self.board.get(pt) == Player.black:
                 black += 1
             else:
-                white += 1                   # only two colours exist
+                white += 1
 
-        return Player.black if black > white else Player.white
+        if   black > white: winner = Player.black
+        elif white > black: winner = Player.white
+        else:               winner = None          # jigo / draw
+        return winner, black, white
