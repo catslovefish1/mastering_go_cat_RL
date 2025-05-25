@@ -4,7 +4,7 @@ import math, random
 from typing import Dict, Optional
 
 from dlgo.gotypes import Player
-from dlgo.goboard_slow import GameState, Move
+from dlgo.goboard_fast import GameState, Move
 
 
 # ────────────────────────── MCTS tree node ──────────────────────────

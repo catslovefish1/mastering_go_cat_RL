@@ -2,10 +2,10 @@ from dlgo.gotypes import Player
 from dlgo.goboard_slow import GameState
 from dlgo.agents import MCTSBot, RandomBot
 
-def duel(num_games=3, board_size=4):
+def duel(num_games=3, board_size=5):
     wins = 0
     for _ in range(num_games):
-        bots = {Player.black: MCTSBot(2),  # ← 200 rollouts per move
+        bots = {Player.black: MCTSBot(1),  # ← 200 rollouts per move
                 Player.white: RandomBot()}
         state = GameState.new_game(board_size)
         while not state.is_over():

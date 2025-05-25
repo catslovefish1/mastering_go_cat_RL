@@ -55,13 +55,7 @@ class GoString:
 
 # ────────── 3. Board ──────────
 class Board:
-
-    @property
-    def grid(self):
-        # could return a *copy* to make it read-only
-        return self._grid
     """Handles stone placement, capture, and liberty bookkeeping."""
-    
     def __init__(self, num_rows, num_cols):
         self.num_rows, self.num_cols = num_rows, num_cols
         self._grid = {}                       # Point → GoString
