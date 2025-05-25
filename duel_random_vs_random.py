@@ -3,7 +3,7 @@ from dlgo.goboard_slow import GameState
 from dlgo.agents.random_bot import RandomBot
 
 
-def duel(num_games: int = 300, board_size: int = 4) -> None:
+def duel(num_games: int = 300, board_size: int = 5) -> None:
     """Play `num_games` purely-random games and print a report every 10 games."""
     black_total = white_total = draw_total = 0
     blk_block = wht_block = drw_block = 0          # per-10-game block counters

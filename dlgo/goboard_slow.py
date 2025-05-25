@@ -183,7 +183,7 @@ class GameState:
                     if self.is_valid_move(candidate):
                         moves.append(candidate)
         moves.append(Move.pass_turn())   # pass is always legal
-        moves.append(Move.resign())      # resign is always legal
+        # moves.append(Move.resign())      # resign is always legal
         return moves
 
 

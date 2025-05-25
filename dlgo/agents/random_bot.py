@@ -12,7 +12,7 @@
 # ---------------------------------------------------------------------
 
 import random
-from dlgo.goboard_fast import Move
+from dlgo.goboard_slow import Move
 
 
 class RandomBot:
