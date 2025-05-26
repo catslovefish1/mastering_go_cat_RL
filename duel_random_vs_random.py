@@ -1,11 +1,11 @@
 # duel_random_vs_random.py
 from dlgo.gotypes import Player
-from dlgo.goboard_fast import GameState
+from dlgo.goboard_nocopy import GameState
 from dlgo.agents.random_tensor_bot import TensorRandomBot
 from dlgo.ascii_board import show_many                         # ← only import we need
 
 # ─────────────────────────────────────────────────────────────
-def duel(num_games=100, board_size=5, report_every=10, preview_boards=1):
+def duel(num_games=2000, board_size=7, report_every=10, preview_boards=1):
     black_wins = white_wins = draws = 0
     blk_blk = wht_blk = drw_blk = 0
     final_boards = []            # store first N boards
