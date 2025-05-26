@@ -18,6 +18,8 @@ _Z_KEYS = [[[secrets.randbits(64) for _ in range(2)]
 _TURN_KEY = {Player.black: secrets.randbits(64),
              Player.white: secrets.randbits(64)}
 
+
+
 # ── Delta: what _apply() needs to undo ─────────────────────────────────────
 Delta = namedtuple('Delta',
                    ['placed', 'captured', 'merged_from',

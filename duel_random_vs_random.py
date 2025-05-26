@@ -5,7 +5,7 @@ from dlgo.agents.random_tensor_bot import TensorRandomBot
 from dlgo.ascii_board import show_many                         # ← only import we need
 
 # ─────────────────────────────────────────────────────────────
-def duel(num_games=2000, board_size=7, report_every=10, preview_boards=1):
+def duel(num_games=1000, board_size=13, report_every=10, preview_boards=10):
     black_wins = white_wins = draws = 0
     blk_blk = wht_blk = drw_blk = 0
     final_boards = []            # store first N boards
@@ -52,3 +52,5 @@ def duel(num_games=2000, board_size=7, report_every=10, preview_boards=1):
 
 if __name__ == "__main__":
     duel()
+    
+    
