@@ -53,4 +53,4 @@ def simulate_batch_games(n: int, size: int):
 
 
 if __name__ == "__main__":
-    simulate_batch_games(n=100, size=5)
+    simulate_batch_games(n=100, size=7)
