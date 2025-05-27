@@ -1,10 +1,19 @@
-# tensor_go_engine.py  •  Shape-safe revision (2025-05-27)
 # --------------------------------------------------------
 from __future__ import annotations
-import torch, torch.nn.functional as F, os
+import os, torch, torch.nn.functional as F          # ← reordered merely for PEP8
 
+# (keep this env-var line if you still want the fallback on older macOS)
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-DEVICE = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+
+# ─── device helper ────────────────────────────────────────────────────
+def _select_device() -> torch.device:
+    """Pick the best available device: MPS → CUDA → CPU."""
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+# ---------------------------------------------------------------------
 
 BLACK, WHITE, EMPTY = 0, 1, -1
 
@@ -12,8 +21,15 @@ BLACK, WHITE, EMPTY = 0, 1, -1
 class TensorBoard:
     """Batch-friendly Go engine implemented entirely with PyTorch tensors."""
     # ------------------------------------------------------------------ #
-    def __init__(self, batch_size: int = 1, board_size: int = 19):
-        self.batch_size, self.board_size, self.device = batch_size, board_size, DEVICE
+    def __init__(self,
+                 batch_size: int = 1,
+                 board_size: int = 19,
+                 device: torch.device | str | None = None):        # ★ NEW arg
+        # choose device (caller can override)
+        self.device = torch.device(device) if device is not None else _select_device()
+
+        self.batch_size  = batch_size
+        self.board_size  = board_size
 
         # (B,2,H,W); uint8 is fine for 0/1 flags
         self.stones = torch.zeros((batch_size, 2, board_size, board_size),
@@ -177,7 +193,8 @@ class TensorBoard:
 
 # ===================================================================== #
 class TensorBatchBot:
-    def __init__(self): self.device = DEVICE
+    def __init__(self, device: torch.device | str | None = None):   # ★ NEW arg
+        self.device = torch.device(device) if device is not None else _select_device()
     def select_moves(self, boards: TensorBoard):
         legal = boards.get_legal_moves_mask()
         B,H,W = legal.shape
