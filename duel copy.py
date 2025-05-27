@@ -349,13 +349,33 @@ def run_tournament(
 def main():
     """Main entry point with example usage."""
     # Example 1: Simple batch simulation
+    print("Example 1: Quick test on 9×9 boards")
     simulate_batch_games(
-        num_games=512,
-        board_size=8,
+        num_games=128,
+        board_size=19,
         show_boards=16,
-        log_interval=128
+        log_interval=32
     )
     
+    # # Example 2: Larger simulation
+    # print("\n\nExample 2: Standard 19×19 simulation")
+    # stats = simulate_batch_games(
+    #     num_games=256,
+    #     board_size=19,
+    #     show_boards=0,
+    #     log_interval=100
+    # )
+    
+    # Example 3: Tournament mode (commented out for speed)
+    # print("\n\nExample 3: Tournament mode")
+    # tournament_results = run_tournament(
+    #     rounds=5,
+    #     games_per_round=100,
+    #     board_size=13
+    # )
+    # print(f"\nTournament Summary:")
+    # print(f"Black win rate: {tournament_results['black_win_rate']:.1%}")
+    # print(f"White win rate: {tournament_results['white_win_rate']:.1%}")
 
 
 if __name__ == "__main__":

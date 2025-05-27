@@ -185,33 +185,16 @@ class TensorBoard(torch.nn.Module):
         return legal
     
     def _detect_ko(self, captured_positions: Tuple[Tensor, Tensor, Tensor]) -> None:
-        """Detect and set ko points for single stone captures (fully vectorized, no loops)"""
+        """Detect and set ko points for single stone captures"""
         batch_idx, rows, cols = captured_positions
         
-        if batch_idx.numel() == 0:
-            return
-        
-        # Count captures per batch using bincount (most efficient for this)
-        capture_counts = torch.bincount(batch_idx, minlength=self.batch_size)
-        
-        # Find batches with exactly one capture
-        single_capture_batches = (capture_counts == 1)
-        
-        if not single_capture_batches.any():
-            return
-        
-        # For batches with single captures, we need to find which index corresponds to each batch
-        # scatter_ will keep the last value written, but for single captures there's only one
-        batch_to_idx = torch.full((self.batch_size,), -1, dtype=torch.long, device=self.device)
-        idx_range = torch.arange(len(batch_idx), device=self.device)
-        batch_to_idx.scatter_(0, batch_idx, idx_range)
-        
-        # Extract positions for single capture batches
-        single_capture_idx = batch_to_idx[single_capture_batches]
-        
-        # Update ko points only for batches with single captures
-        self.ko_points[single_capture_batches, 0] = rows[single_capture_idx].to(torch.int16)
-        self.ko_points[single_capture_batches, 1] = cols[single_capture_idx].to(torch.int16)
+        # Count captures per batch
+        for b in batch_idx.unique():
+            mask = (batch_idx == b)
+            if mask.sum() == 1:  # Single stone capture
+                idx = mask.nonzero(as_tuple=True)[0][0]
+                self.ko_points[b, 0] = rows[idx]
+                self.ko_points[b, 1] = cols[idx]
     
     # ==================== LEGAL MOVES ====================
     

@@ -25,18 +25,14 @@ MaskTensor = Tensor  # Shape: (B, H, W) boolean mask
 
 # ========================= DEVICE MANAGEMENT =========================
 
+#  Device selection with CUDA > MPS > CPU priority
 def select_device() -> torch.device:
-    """Select best available device with clear priority.
-    
-    Returns:
-        torch.device: MPS > CUDA > CPU in order of preference
-    """
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    elif torch.cuda.is_available():
+    """Select best available device: CUDA > MPS > CPU"""
+    if torch.cuda.is_available():
         return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
-
 
 # ========================= RANDOM GO AGENT =========================
 
@@ -173,8 +169,12 @@ class TensorBatchBot:
         
         # Normalize each row to sum to 1
         # keepdim=True maintains shape for broadcasting
+
+        
         row_sums = probabilities.sum(dim=1, keepdim=True)
-        probabilities = probabilities / row_sums
+
+        safe_sums = row_sums.clamp(min=1.0)
+        probabilities = probabilities / safe_sums
         
         return probabilities
     
@@ -219,125 +219,3 @@ class TensorBatchBot:
         return torch.stack([rows, cols], dim=1)
 
 
-# ========================= ALTERNATIVE AGENTS =========================
-
-class WeightedPolicyBot(TensorBatchBot):
-    """Bot that uses position-based weights for move selection.
-    
-    Demonstrates how to extend the base bot with custom policies
-    while maintaining tensor-native patterns.
-    """
-    
-    def __init__(
-        self, 
-        device: Optional[torch.device | str] = None,
-        center_bias: float = 2.0
-    ):
-        """Initialize with device and policy parameters.
-        
-        Args:
-            device: Computation device
-            center_bias: How much to prefer center moves (>1 = prefer center)
-        """
-        super().__init__(device)
-        self.center_bias = center_bias
-        self._position_weights: Optional[Tensor] = None
-    
-    def _get_position_weights(self, height: int, width: int) -> Tensor:
-        """Get cached position weights favoring center positions.
-        
-        Args:
-            height: Board height
-            width: Board width
-            
-        Returns:
-            Shape (H, W) weight tensor
-        """
-        # Cache weights for efficiency
-        if (self._position_weights is None or 
-            self._position_weights.shape != (height, width)):
-            
-            # Create distance from center
-            row_coords = torch.arange(height, device=self.device).float()
-            col_coords = torch.arange(width, device=self.device).float()
-            
-            row_center = (height - 1) / 2
-            col_center = (width - 1) / 2
-            
-            row_dist = (row_coords - row_center).abs()
-            col_dist = (col_coords - col_center).abs()
-            
-            # 2D distance map
-            row_dist = row_dist.view(-1, 1)
-            col_dist = col_dist.view(1, -1)
-            distance = (row_dist**2 + col_dist**2).sqrt()
-            
-            # Convert distance to weights (closer to center = higher weight)
-            max_dist = distance.max()
-            self._position_weights = 1 + (max_dist - distance) * self.center_bias / max_dist
-        
-        return self._position_weights
-    
-    def _compute_uniform_probabilities(self, flat_legal: Tensor) -> ProbabilityTensor:
-        """Override to use weighted probabilities instead of uniform.
-        
-        Args:
-            flat_legal: Shape (num_games, H*W) legal moves mask
-            
-        Returns:
-            Weighted probability distribution
-        """
-        batch_size = flat_legal.shape[0]
-        board_size = flat_legal.shape[1]
-        height = width = int(board_size ** 0.5)  # Assume square board
-        
-        # Get position weights and flatten
-        weights = self._get_position_weights(height, width)
-        flat_weights = weights.view(-1)
-        
-        # Apply weights only to legal positions
-        weighted_legal = flat_legal.float() * flat_weights.unsqueeze(0)
-        
-        # Normalize
-        row_sums = weighted_legal.sum(dim=1, keepdim=True)
-        probabilities = weighted_legal / row_sums.clamp(min=1e-8)
-        
-        return probabilities
-
-
-# ========================= USAGE EXAMPLE =========================
-
-def example_usage():
-    """Demonstrate how to use the tensor-native bot."""
-    # Initialize bot on best available device
-    bot = TensorBatchBot()
-    
-    # Or use weighted policy
-    weighted_bot = WeightedPolicyBot(center_bias=3.0)
-    
-    # Create batch of games
-    batch_size = 64
-    board_size = 19
-    games = TensorBoard(
-        batch_size=batch_size,
-        board_size=board_size,
-        device=bot.device
-    )
-    
-    # Play some moves
-    for _ in range(10):
-        moves = bot.select_moves(games)
-        games.step(moves)
-        
-        # Check for finished games
-        finished = games.is_game_over()
-        if finished.all():
-            break
-    
-    # Get final scores
-    scores = games.compute_scores()
-    print(f"Final scores shape: {scores.shape}")  # (64, 2)
-
-
-if __name__ == "__main__":
-    example_usage()
