@@ -16,7 +16,7 @@ from interface.ascii import show
 
 # ---------------------------------------------------------------------------
 NUM_TO_SHOW = 3       # 0 = skip pretty print entirely
-LOG_EVERY  = 10      # moves between progress lines (0 = silent)
+LOG_EVERY  = 100      # moves between progress lines (0 = silent)
 
 # ---------------------------------------------------------------------------
 
