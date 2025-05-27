@@ -189,22 +189,3 @@ class TensorBoard:
         return torch.stack([cur,opp,legal,cur_lib,turn],1)
 
 
-
-
-# ===================================================================== #
-class TensorBatchBot:
-    def __init__(self, device: torch.device | str | None = None):   # ★ NEW arg
-        self.device = torch.device(device) if device is not None else _select_device()
-    def select_moves(self, boards: TensorBoard):
-        legal = boards.get_legal_moves_mask()
-        B,H,W = legal.shape
-        flat = legal.view(B,-1)
-        moves = torch.full((B,2), -1, dtype=torch.int32, device=self.device)
-        play  = flat.any(1)
-        if play.any():
-            probs = flat[play].float(); probs/=probs.sum(1,keepdim=True)
-            idx = torch.multinomial(probs,1).squeeze(1).to(torch.int32)
-            moves[play,0] = idx // W
-            moves[play,1] = idx %  W
-        return moves
-

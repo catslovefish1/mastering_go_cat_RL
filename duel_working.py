@@ -2,17 +2,21 @@ from __future__ import annotations
 
 """Bench‑friendly batch self‑play driver.
 
-
+Changes vs. original `duel_random_vs_random.py`
+------------------------------------------------
+* progress logging throttled by `LOG_EVERY` (set 0 to silence)
+* avoids per‑step `.item()` sync: copies tensor to CPU once per log
+* sample‑board printing gated by `NUM_TO_SHOW`
 """
 
 import time
-from engine.go_engine import TensorBoard
+from engine.tensor_board_optimized import TensorBoard
 from agents.basic import TensorBatchBot
 from interface.ascii import show
 
 # ---------------------------------------------------------------------------
-NUM_TO_SHOW = 0       # 0 = skip pretty print entirely
-LOG_EVERY  = 150      # moves between progress lines (0 = silent)
+NUM_TO_SHOW = 3       # 0 = skip pretty print entirely
+LOG_EVERY  = 10      # moves between progress lines (0 = silent)
 
 # ---------------------------------------------------------------------------
 
@@ -50,4 +54,4 @@ def simulate_batch_games(n: int, size: int):
 
 
 if __name__ == "__main__":
-    simulate_batch_games(n=1000, size=7)
+    simulate_batch_games(n=100, size=7)
