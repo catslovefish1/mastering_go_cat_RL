@@ -24,7 +24,7 @@ from interface.ascii import show
 class SimulationConfig:
     num_games: int = 100
     board_size: int = 19
-    max_moves_factor: float = 10.0         # max plies = board² × factor
+    max_moves_factor: int= 10        # max plies = board² × factor
     show_boards: int = 0
     log_interval: int = 100
     device: Optional[torch.device] = None
@@ -154,10 +154,11 @@ def simulate_batch_games(num_games=100, board_size=19, **kw) -> GameStatistics:
 # Main entry
 # ---------------------------------------------------------------------
 def main():
-    simulate_batch_games(num_games=2**16,
+    simulate_batch_games(num_games=2**10,
                          board_size=19,
                          show_boards=4,
                          log_interval=64)
 
 if __name__ == "__main__":
     main()
+

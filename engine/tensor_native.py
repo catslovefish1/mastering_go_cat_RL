@@ -94,6 +94,7 @@ class TensorBoard(torch.nn.Module):
             torch.randint(0, max_hash, (2, self.board_size, self.board_size), 
                          dtype=torch.int64, device=self.device)
         )
+        print(f"Zobrist stones on which device: {self.zobrist_stones.device}")
         self.register_buffer(
             "zobrist_turn",
             torch.randint(0, max_hash, (2,), dtype=torch.int64, device=self.device)
@@ -523,49 +524,5 @@ def compile_optimized_board():
         return TensorBoard
 
 
-# ==================== USAGE EXAMPLE ====================
 
-if __name__ == "__main__":
-    # Create optimized board
-    board = TensorBoard(batch_size=512, board_size=19)
-    
-    # Or with compilation
-    BoardClass = compile_optimized_board()
-    board = BoardClass(batch_size=512, board_size=19)
-    
-    # Example game simulation
-    import time
-    
-    start_time = time.time()
-    moves_played = 0
-    
-    while not board.is_game_over().all() and moves_played < 1000:
-        # Get legal moves
-        legal = board.legal_moves()
-        
-        # Sample random moves
-        positions = torch.full((board.batch_size, 2), -1, dtype=torch.int32, device=board.device)
-        
-        for b in range(board.batch_size):
-            if board.is_game_over()[b]:
-                continue
-                
-            legal_positions = legal[b].nonzero(as_tuple=False)
-            if legal_positions.numel() > 0:
-                # Random selection
-                idx = torch.randint(0, legal_positions.shape[0], (1,)).item()
-                positions[b] = legal_positions[idx]
-        
-        # Execute moves
-        board.step(positions)
-        moves_played += board.batch_size
-    
-    elapsed = time.time() - start_time
-    print(f"Played {moves_played} moves in {elapsed:.2f}s")
-    print(f"Speed: {moves_played/elapsed:.0f} moves/second")
-    
-    # Get final scores
-    scores = board.compute_scores()
-    print(f"\nFinal scores:")
-    print(f"Black average: {scores[:, 0].mean():.1f}")
-    print(f"White average: {scores[:, 1].mean():.1f}")
+   
