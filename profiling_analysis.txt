@@ -1,0 +1,117 @@
+================================================================================
+GO ENGINE PROFILING ANALYSIS
+================================================================================
+
+SUMMARY
+----------------------------------------
+Total profiled duration: 4872917757.00 ms
+Total events recorded: 51229
+Unique operations: 482
+
+TOP 20 OPERATIONS BY TOTAL TIME
+--------------------------------------------------------------------------------
+Operation                           Total(ms)    Count    Avg(ms)    Max(ms)    %     
+--------------------------------------------------------------------------------
+PyTorch Profiler (0)                138.59       1        138.595    138.595    6.7   
+duel.py(184): <module>              138.52       1        138.520    138.520    6.7   
+duel.py(178): main                  138.52       1        138.519    138.519    6.7   
+duel.py(175): simulate_batch_games  138.52       1        138.518    138.518    6.7   
+duel.py(101): simulate              138.52       1        138.517    138.517    6.7   
+duel.py(138): _run_game_loop        138.52       1        138.516    138.516    6.7   
+board_step                          104.39       6        17.398     57.311     5.0   
+engine/tensor_native.py(363): step  104.25       6        17.375     57.275     5.0   
+engine/tensor_native.py(395): _plac 62.10        6        10.349     49.341     3.0   
+ProfilerStep#8                      61.44        1        61.444     61.444     3.0   
+engine/tensor_native.py(410): _proc 60.94        6        10.156     49.164     2.9   
+aten::nonzero                       58.01        83       0.699      10.391     2.8   
+engine/tensor_native.py(446): _remo 46.93        1        46.927     46.927     2.3   
+aten::item                          36.68        338      0.109      0.898      1.8   
+aten::_local_scalar_dense           36.55        338      0.108      0.897      1.8   
+aten::index                         29.64        92       0.322      6.138      1.4   
+engine/tensor_native.py(45): wrappe 28.26        6        4.709      5.584      1.4   
+engine/tensor_native.py(163): _togg 26.49        6        4.415      4.919      1.3   
+engine/tensor_native.py(229): _dete 26.16        1        26.163     26.163     1.3   
+select_moves                        23.30        6        3.884      4.042      1.1   
+
+
+CATEGORIZED ANALYSIS
+================================================================================
+
+BOARD_LOGIC - 31.34 ms (1.5%)
+------------------------------------------------------------
+  engine/tensor_native.py(300): legal_moves: 9.74 ms (6 calls, 0.5%)
+  agents/basic.py(126): _sample_legal_moves: 8.71 ms (6 calls, 0.4%)
+  engine/tensor_native.py(263): _flood_fill: 7.35 ms (6 calls, 0.4%)
+  engine/tensor_native.py(137): _count_neighbors: 4.94 ms (30 calls, 0.2%)
+  engine/tensor_native.py(468): is_game_over: 0.60 ms (24 calls, 0.0%)
+
+MOVE_EXECUTION - 517.20 ms (24.9%)
+------------------------------------------------------------
+  board_step: 104.39 ms (6 calls, 5.0%)
+  engine/tensor_native.py(363): step: 104.25 ms (6 calls, 5.0%)
+  engine/tensor_native.py(395): _place_stones: 62.10 ms (6 calls, 3.0%)
+  ProfilerStep#8: 61.44 ms (1 calls, 3.0%)
+  engine/tensor_native.py(410): _process_captures: 60.94 ms (6 calls, 2.9%)
+
+STATE_MANAGEMENT - 59.80 ms (2.9%)
+------------------------------------------------------------
+  engine/tensor_native.py(163): _toggle_turn: 26.49 ms (6 calls, 1.3%)
+  engine/tensor_native.py(229): _detect_ko: 26.16 ms (1 calls, 1.3%)
+  engine/tensor_native.py(150): _update_hash: 7.14 ms (7 calls, 0.3%)
+  engine/tensor_native.py(173): _invalidate_cache: 0.00 ms (6 calls, 0.0%)
+
+BOT_LOGIC - 46.47 ms (2.2%)
+------------------------------------------------------------
+  select_moves: 23.30 ms (6 calls, 1.1%)
+  agents/basic.py(62): select_moves: 23.16 ms (6 calls, 1.1%)
+
+MEMORY_OPS - 12.69 ms (0.6%)
+------------------------------------------------------------
+  aten::copy_: 4.05 ms (564 calls, 0.2%)
+  aten::_to_copy: 4.03 ms (177 calls, 0.2%)
+  aten::nonzero_numpy: 2.81 ms (7 calls, 0.1%)
+  engine/tensor_native.py(185): empty_mask: 0.36 ms (18 calls, 0.0%)
+  aten::clone: 0.34 ms (162 calls, 0.0%)
+
+TENSOR_OPS - 137.59 ms (6.6%)
+------------------------------------------------------------
+  aten::nonzero: 58.01 ms (83 calls, 2.8%)
+  aten::is_nonzero: 19.65 ms (111 calls, 0.9%)
+  <frozen importlib._bootstrap>(480): _call_with_frames_removed: 15.93 ms (6 calls, 0.8%)
+  aten::count_nonzero: 13.39 ms (166 calls, 0.6%)
+  <built-in method nonzero of Tensor object at 0x1135f4dc0>: 13.22 ms (8 calls, 0.6%)
+
+
+BOTTLENECK ANALYSIS
+================================================================================
+
+Operations taking >5% of total time:
+  - PyTorch Profiler (0): 6.7% (138.59 ms)
+  - duel.py(184): <module>: 6.7% (138.52 ms)
+  - duel.py(178): main: 6.7% (138.52 ms)
+  - duel.py(175): simulate_batch_games: 6.7% (138.52 ms)
+  - duel.py(101): simulate: 6.7% (138.52 ms)
+  - duel.py(138): _run_game_loop: 6.7% (138.52 ms)
+  - board_step: 5.0% (104.39 ms)
+  - engine/tensor_native.py(363): step: 5.0% (104.25 ms)
+
+
+High frequency operations (>1000 calls):
+  - <built-in function len>: 5867 calls (avg 0.000 ms/call)
+  - <built-in method __new__ of type object at 0x1016471f0>: 5663 calls (avg 0.000 ms/call)
+  - collections/__init__.py(450): _make: 5654 calls (avg 0.000 ms/call)
+  - tokenize.py(492): tokenize: 5654 calls (avg 0.001 ms/call)
+  - tokenize.py(583): _generate_tokens_from_c_tokenizer: 5654 calls (avg 0.001 ms/call)
+  - <built-in function isinstance>: 2350 calls (avg 0.000 ms/call)
+  - aten::as_strided: 2167 calls (avg 0.000 ms/call)
+  - aten::slice: 1575 calls (avg 0.001 ms/call)
+
+
+OPTIMIZATION RECOMMENDATIONS
+================================================================================
+
+No major bottlenecks identified. Performance is well-balanced.
+
+================================================================================
+END OF ANALYSIS
+================================================================================
