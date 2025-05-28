@@ -1,0 +1,10 @@
+project/
+├── utils/
+│   └── shared.py          # Centralized utilities
+├── engine/
+│   └── tensor_native.py   # Core Go engine
+├── agents/
+│   └── basic.py          # Random agent
+├── interface/
+│   └── ascii.py          # Display utilities
+└── duel.py               # Simulation driver
