@@ -1,8 +1,7 @@
 """
-tensor_batch_duel.py — batch self-play driver (optimised, no profiler)
-
-Run:
-    python tensor_batch_duel.py
+tensor_batch_duel.py — batch self-play driver with
+one-game move-history print-out that copes with
+(flat index) *or* (row,col) move encodings.
 """
 from __future__ import annotations
 
@@ -24,8 +23,8 @@ from interface.ascii import show
 class SimulationConfig:
     num_games: int = 100
     board_size: int = 19
-    max_moves_factor: int = 10      # max plies = board² × factor
-    show_boards: int = 0            # 0 → suppress pretty-printed boards
+    max_moves_factor: int = 10
+    show_boards: int = 0
     log_interval: int = 100
     device: Optional[torch.device] = None
 
@@ -44,7 +43,7 @@ class GameStatistics:
     black_wins: int
     white_wins: int
     draws: int
-    final_scores: Tensor            # (B, 2)
+    final_scores: Tensor
 
     @property
     def black_win_rate(self) -> float: return self.black_wins / self.total_games
@@ -73,12 +72,8 @@ class BatchGameSimulator:
     def __init__(self, cfg: SimulationConfig):
         self.cfg    = cfg
         self.device = cfg.device or self._select_device()
-
-        # ==== NEW ----------------------------------------------------
-        # keep the complete move list for *game 0* (the first board)
-        # elements: (colour, (row, col)) with 1-based coordinates
-        self.first_game_history: List[Tuple[str, Tuple[int, int]]] = []
-        # -------------------------------------------------------------
+        # store (colour, (row,col)) or (colour, ('pass',))
+        self.first_game_history: List[Tuple[str, Tuple[int, int] | Tuple[str]]] = []
 
     # ----------------------- helpers ---------------------------------
     @staticmethod
@@ -98,40 +93,51 @@ class BatchGameSimulator:
         bot = TensorBatchBot(device=self.device)
 
         t0 = time.time()
-        with torch.no_grad():                       # ❶ no autograd
+        with torch.no_grad():
             total_moves = self._run_game_loop(boards, bot)
         dt = time.time() - t0
 
         stats = self._compute_stats(boards, total_moves, dt)
         self._display_results(stats)
-        self._display_history()          # ==== NEW ====
-        self._display_boards(boards)     # (optional pretty boards)
+        self._display_history()
+        self._display_boards(boards)
         return stats
 
     # ----------------------- core loop -------------------------------
     def _run_game_loop(self, boards: TensorBoard, bot: TensorBatchBot) -> int:
-        ply       = 0                                 # number of plies so far
-        finished  = boards.is_game_over()             # device tensor cache
+        ply      = 0
+        finished = boards.is_game_over()
 
         while ply < self.cfg.max_moves and not finished.all():
-            moves = bot.select_moves(boards)          # (B,) tensor of indices
+            moves = bot.select_moves(boards)           # shape (B,)  or (B,2)
             boards.step(moves)
 
-            # ==== NEW ------------------------------------------------
-            # remember the move for the first board only (index 0)
-            mv_idx = moves[0].item()                  # integer in 0 … N²-1 (or -1/pass)
-            if mv_idx >= 0:                           # ignore passes for now
-                colour = 'B' if (ply % 2 == 0) else 'W'
-                N      = boards.size                  # board dimension
-                row    = mv_idx // N + 1              # 1-based for humans
-                col    = mv_idx %  N + 1
-                self.first_game_history.append((colour, (row, col)))
+            # ---------- record move for board 0 ----------------------
+            mv0 = moves[0]                             # tensor
+            colour = 'B' if (ply % 2 == 0) else 'W'
+
+            # (1) flat index encoding  --------------------------------
+            if mv0.numel() == 1:
+                idx = mv0.item()
+                if idx >= 0:                           # regular move
+                    N   = self.cfg.board_size
+                    row = idx // N
+                    col = idx %  N
+                    self.first_game_history.append((colour, (row + 1, col + 1)))
+                else:                                  # pass
+                    self.first_game_history.append((colour, ('pass',)))
+
+            # (2) (row,col) pair encoding -----------------------------
             else:
-                colour = 'B' if (ply % 2 == 0) else 'W'
-                self.first_game_history.append((colour, ('pass',)))
+                r = mv0[0].item()
+                c = mv0[1].item()
+                if r < 0 or c < 0:                     # pass
+                    self.first_game_history.append((colour, ('pass',)))
+                else:
+                    self.first_game_history.append((colour, (r + 1, c + 1)))
             # ---------------------------------------------------------
 
-            finished |= boards.is_game_over()         # in-place OR
+            finished |= boards.is_game_over()
             ply += 1
             self._log_progress(finished, ply)
 
@@ -140,7 +146,7 @@ class BatchGameSimulator:
     # ----------------------- utilities -------------------------------
     def _log_progress(self, finished: Tensor, ply: int) -> None:
         if self.cfg.log_interval and ply % self.cfg.log_interval == 0:
-            done = finished.sum().item()              # one sync per interval
+            done = finished.sum().item()
             print(f"Move {ply:4d}: {done}/{self.cfg.num_games} finished")
 
     def _compute_stats(self, boards: TensorBoard,
@@ -159,9 +165,7 @@ class BatchGameSimulator:
         print(f"White wins : {s.white_wins:4d} ({s.white_win_rate:6.1%})")
         print(f"Draws      : {s.draws:4d} ({s.draw_rate:6.1%})\n")
 
-    # ==== NEW --------------------------------------------------------
     def _display_history(self) -> None:
-        """Pretty-print the complete move list for game #1."""
         if not self.first_game_history:
             return
         print("Move history — Game 1")
@@ -171,11 +175,9 @@ class BatchGameSimulator:
             else:
                 r, c = pt
                 print(f"Step {k:3d}: {clr}  ({r:2d}, {c:2d})")
-        print()  # blank line after history
-    # ---------------------------------------------------------------
+        print()
 
     def _display_boards(self, boards: TensorBoard) -> None:
-        """Original per-game ASCII boards (kept optional)."""
         if self.cfg.show_boards:
             n = min(self.cfg.show_boards, self.cfg.num_games)
             for i in range(n):
@@ -194,9 +196,9 @@ def simulate_batch_games(num_games=100, board_size=19, **kw) -> GameStatistics:
 # ---------------------------------------------------------------------
 def main():
     simulate_batch_games(
-        num_games=2**10,
-        board_size=19,
-        show_boards=0,      # keep ASCII boards silent; only history prints
+        num_games=2**1,
+        board_size=5,
+        show_boards=0,
         log_interval=64,
     )
 

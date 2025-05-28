@@ -154,9 +154,9 @@ def simulate_batch_games(num_games=100, board_size=19, **kw) -> GameStatistics:
 # Main entry
 # ---------------------------------------------------------------------
 def main():
-    simulate_batch_games(num_games=2**10,
-                         board_size=19,
-                         show_boards=4,
+    simulate_batch_games(num_games=2**9,
+                         board_size=8,
+                         show_boards=2,
                          log_interval=64)
 
 if __name__ == "__main__":
