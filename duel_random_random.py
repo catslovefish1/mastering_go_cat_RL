@@ -1,5 +1,5 @@
 """
-Batch self-play driver leveraging TensorBatchBot.
+Batch self-play driver leveraging TensorBatchBot with timing analysis.
 
 Run:
     python duel.py
@@ -30,6 +30,7 @@ class SimulationConfig:
     show_boards: int = 0                # number of final boards to print
     log_interval: int = 100             # progress print frequency (ply)
     device: Optional[torch.device | str] = None  # override auto-device
+    enable_timing: bool = True          # enable timing analysis
 
     @property
     def max_moves(self) -> int:
@@ -92,7 +93,13 @@ class BatchGameSimulator:
             f"{self.cfg.board_size}×{self.cfg.board_size} ({self.device})"
         )
 
-        boards = TensorBoard(self.cfg.num_games, self.cfg.board_size, self.device)
+        # Create board with timing enabled
+        boards = TensorBoard(
+            self.cfg.num_games, 
+            self.cfg.board_size, 
+            self.device,
+            enable_timing=self.cfg.enable_timing
+        )
         bot = TensorBatchBot(self.device)
 
         t0 = time.time()
@@ -103,6 +110,28 @@ class BatchGameSimulator:
         stats = self._collect_stats(boards, moves_made, elapsed)
         self._print_summary(stats)
         self._maybe_show_boards(boards)
+        
+        # Print timing report if enabled
+        if self.cfg.enable_timing and hasattr(boards, 'print_timing_report'):
+            boards.print_timing_report(top_n=30)
+            
+            # Additional performance metrics
+            print("\n" + "="*80)
+            print("PERFORMANCE METRICS")
+            print("="*80)
+            print(f"Total simulation time: {elapsed:.2f} seconds")
+            print(f"Moves per second: {moves_made/elapsed:.1f}")
+            print(f"Games per second: {self.cfg.num_games/elapsed:.1f}")
+            print(f"Time per move: {elapsed/moves_made*1000:.2f} ms")
+            print(f"Time per game: {elapsed/self.cfg.num_games:.3f} seconds")
+            
+            if self.device.type == 'mps':
+                print("\nMPS-Specific Optimization Suggestions:")
+                print("- Consider replacing conv2d with manual neighbor gathering")
+                print("- Pre-allocate workspace tensors to reduce allocation overhead")
+                print("- Minimize synchronization points (.any(), .item() calls)")
+                print("- Use torch.compile for frequently called functions")
+        
         return stats
 
     # ------------------------- core loop -------------------------------------
@@ -154,16 +183,40 @@ class BatchGameSimulator:
 # Convenience wrapper
 # -----------------------------------------------------------------------------
 
-def simulate_batch_games(num_games=100, board_size=19, **kwargs) -> GameStatistics:
+def simulate_batch_games(num_games=100, board_size=19, enable_timing=True, **kwargs) -> GameStatistics:
     """Run a batch of games with minimal boilerplate."""
-    return BatchGameSimulator(SimulationConfig(num_games, board_size, **kwargs)).simulate()
+    return BatchGameSimulator(
+        SimulationConfig(num_games, board_size, enable_timing=enable_timing, **kwargs)
+    ).simulate()
 
 # -----------------------------------------------------------------------------
 # Command-line entry point
 # -----------------------------------------------------------------------------
 
 def main() -> None:
-    simulate_batch_games(num_games=512, board_size=8, show_boards=2, log_interval=64)
+    # Run with timing analysis enabled
+    print("Running batch Go simulation with timing analysis...")
+    print("="*80)
+    
+    # Warmup run (important for GPU)
+    print("Performing warmup run...")
+    simulate_batch_games(
+        num_games=64, 
+        board_size=9, 
+        show_boards=0, 
+        log_interval=0,
+        enable_timing=False
+    )
+    
+    # Main timing run
+    print("\nStarting main timing analysis run...")
+    simulate_batch_games(
+        num_games=2**16,  # 512 games
+        board_size=19,     # 9x9 board
+        show_boards=2,    # Don't show boards
+        log_interval=2**7,  # Log every 64 moves
+        enable_timing=True  # Enable timing
+    )
 
 if __name__ == "__main__":
     main()
