@@ -181,35 +181,7 @@ class TensorBoard(torch.nn.Module):
             self.register_buffer("position_hash", torch.zeros(B, dtype=torch.int64, device=self.device))
             self.register_buffer("ko_points", torch.full((B, 2), -1, dtype=torch.int8, device=self.device))
             self.register_buffer("pass_count", torch.zeros(B, dtype=torch.uint8, device=self.device))
-            self.flat_union_find_table()
     
-    def flat_union_find_table(self) -> None:
-        """Initialize flattened union-find table for efficient group tracking"""
-        B, H, W = self.batch_size, self.board_size, self.board_size
-        N_squared = H * W
-    
-        # Create flattened union-find structure
-        # Shape: (batch_size, board_size*board_size, 3)
-        # Column 0: Colour (initialized to -1, for empty)
-        # Column 1: Parent
-        # Column 2: liberty count (initialized to 0)
-        self.register_buffer(
-        "flatten_union_find", 
-        torch.zeros((B, N_squared, 3), dtype=torch.int32, device=self.device)
-    )
-    
-            
-        # Initialize Colour (initialized to -1, for empty)
-        self.flatten_union_find[:, :, 0] = -1
-        
-        # Initialize parent indices to point to self
-        indices = torch.arange(N_squared, device=self.device)
-        self.flatten_union_find[:, :, 1] = indices.unsqueeze(0).expand(B, -1)
-
-    
-    # Liberty count starts at 0 (already zero from torch.zeros)
-        
-
     # ==================== CORE UTILITIES ====================
     
     @timed_method
@@ -257,7 +229,6 @@ class TensorBoard(torch.nn.Module):
     def _invalidate_cache(self) -> None:
         """Clear cached values"""
         self._cache.clear()
-    
     
     # ==================== BOARD QUERIES ====================
     
@@ -487,6 +458,7 @@ class TensorBoard(torch.nn.Module):
         
         # Store iteration count separately (not as timing)
         self.flood_fill_iterations.append(iterations)
+        print(groups)
         return groups
     
     @timed_method
@@ -665,22 +637,3 @@ class TensorBoard(torch.nn.Module):
         
         # Note: .any() is actually optimized by PyTorch, but it's good to track
         return problem_methods
-    
-    
-    def print_union_find_grid(self, batch_idx: int = 0, column: int = 0) -> None:
-        """Print union-find data in grid format
-        column: 0=Colour, 1=Parent, 2=Liberty
-        """
-        column_names = ["Colour", "Parent", "Liberty"]
-        print(f"\n{column_names[column]} values for batch {batch_idx}:")
-        print("-" * (self.board_size * 4 + 1))
-    
-        uf_data = self.flatten_union_find[batch_idx, :, column].view(self.board_size, self.board_size)
-    
-        for row in range(self.board_size):
-            row_str = "|"
-            for col in range(self.board_size):
-                value = uf_data[row, col].item()
-                row_str += f"{value:3}|"
-            print(row_str)
-        print("-" * (self.board_size * 4 + 1))

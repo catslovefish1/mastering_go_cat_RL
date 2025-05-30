@@ -101,7 +101,11 @@ class BatchGameSimulator:
             enable_timing=self.cfg.enable_timing
         )
         bot = TensorBatchBot(self.device)
-
+        
+        boards.print_union_find_grid(batch_idx=0, column=0)
+        boards.print_union_find_grid(batch_idx=0, column=1)
+        boards.print_union_find_grid(batch_idx=0, column=2)
+        
         t0 = time.time()
         with torch.no_grad():  # inference mode – gradients disabled
             moves_made = self._play_games(boards, bot)
@@ -125,12 +129,7 @@ class BatchGameSimulator:
             print(f"Time per move: {elapsed/moves_made*1000:.2f} ms")
             print(f"Time per game: {elapsed/self.cfg.num_games:.3f} seconds")
             
-            if self.device.type == 'mps':
-                print("\nMPS-Specific Optimization Suggestions:")
-                print("- Consider replacing conv2d with manual neighbor gathering")
-                print("- Pre-allocate workspace tensors to reduce allocation overhead")
-                print("- Minimize synchronization points (.any(), .item() calls)")
-                print("- Use torch.compile for frequently called functions")
+
         
         return stats
 
@@ -138,17 +137,23 @@ class BatchGameSimulator:
     def _play_games(self, boards: TensorBoard, bot: TensorBatchBot) -> int:
         finished = boards.is_game_over()  # (B,) bool on device
         ply = 0
-        while ply < self.cfg.max_moves and not finished.all():
+        
+        for ply in range(self.cfg.max_moves):
             boards.step(bot.select_moves(boards))
             finished |= boards.is_game_over()  # inplace OR, no extra alloc
             ply += 1
 
             if self.cfg.log_interval and ply % self.cfg.log_interval == 0:
+                finished_count = finished.sum().cpu()  # Transfer to CPU (non-blocking)
                 print(
-                    f"Ply {ply:4d}: {finished.sum().item()}/"  # one sync
-                    f"{self.cfg.num_games} finished"
+                  f"Ply {ply:4d}: {finished_count}/"  # No .item() - Python converts tensor to string
+                   f"{self.cfg.num_games} finished"
                 )
         return ply
+    
+    
+    
+    
 
     # ------------------------- analysis --------------------------------------
     def _collect_stats(
@@ -198,23 +203,15 @@ def main() -> None:
     print("Running batch Go simulation with timing analysis...")
     print("="*80)
     
-    # Warmup run (important for GPU)
-    print("Performing warmup run...")
-    simulate_batch_games(
-        num_games=64, 
-        board_size=9, 
-        show_boards=0, 
-        log_interval=0,
-        enable_timing=False
-    )
+
     
     # Main timing run
     print("\nStarting main timing analysis run...")
     simulate_batch_games(
-        num_games=2**16,  # 512 games
-        board_size=19,     # 9x9 board
+        num_games=1,  # 512 games
+        board_size=7,     # 9x9 board
         show_boards=2,    # Don't show boards
-        log_interval=2**7,  # Log every 64 moves
+        log_interval=64,  # Log every 64 moves
         enable_timing=True  # Enable timing
     )
 

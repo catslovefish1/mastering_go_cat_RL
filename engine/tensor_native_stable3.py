@@ -1,13 +1,10 @@
-"""tensor_native.py - Optimized Go engine with timing instrumentation.
+"""tensor_native.py - Go engine with timing instrumentation.
 
 Key improvements:
 1. Uses centralized utilities from utils.shared
 2. Cleaner separation of concerns
 3. More functional programming style
-4. Comprehensive timing instrumentation for MPS performance analysis
-5. Optimized hash updates with unified Zobrist table
-6. Improved ko detection without CPU-GPU sync
-7. Enhanced timing report with percentiles and visualizations
+4. ADDED: Comprehensive timing instrumentation for MPS performance analysis
 """
 
 from __future__ import annotations
@@ -135,41 +132,18 @@ class TensorBoard(torch.nn.Module):
                                 dtype=torch.float32, device=self.device)
             self.register_buffer("neighbor_kernel", kernel.unsqueeze(0).unsqueeze(0))
             
-            # Unified Zobrist hashing
-            self._init_zobrist_table()
-    
-    def _init_zobrist_table(self) -> None:
-        """Initialize unified Zobrist hash table"""
-        torch.manual_seed(42)
-        max_hash = torch.iinfo(torch.int64).max
-        
-        # Total elements needed:
-        # - 2 * board_size * board_size for stones (black and white)
-        # - 2 for turn (black's turn, white's turn)
-        total_elements = 2 * self.board_size * self.board_size + 2
-        
-        # Create flat unified table
-        self.register_buffer(
-            "zobrist_unified", 
-            torch.randint(0, max_hash, (total_elements,), dtype=torch.int64, device=self.device)
-        )
-        
-        # Define indices for different components
-        stones_end = 2 * self.board_size * self.board_size
-        
-        # Create views for easier access
-        self.register_buffer(
-            "zobrist_stones_flat",
-            self.zobrist_unified[:stones_end].view(2, self.board_size * self.board_size)
-        )
-        self.register_buffer(
-            "zobrist_stones",
-            self.zobrist_unified[:stones_end].view(2, self.board_size, self.board_size)
-        )
-        self.register_buffer(
-            "zobrist_turn",
-            self.zobrist_unified[stones_end:stones_end + 2]
-        )
+            # Zobrist hashing
+            torch.manual_seed(42)
+            max_hash = torch.iinfo(torch.int64).max
+            self.register_buffer(
+                "zobrist_stones",
+                torch.randint(0, max_hash, (2, self.board_size, self.board_size), 
+                             dtype=torch.int64, device=self.device)
+            )
+            self.register_buffer(
+                "zobrist_turn",
+                torch.randint(0, max_hash, (2,), dtype=torch.int64, device=self.device)
+            )
     
     def _init_state(self) -> None:
         """Initialize mutable game state"""
@@ -181,35 +155,7 @@ class TensorBoard(torch.nn.Module):
             self.register_buffer("position_hash", torch.zeros(B, dtype=torch.int64, device=self.device))
             self.register_buffer("ko_points", torch.full((B, 2), -1, dtype=torch.int8, device=self.device))
             self.register_buffer("pass_count", torch.zeros(B, dtype=torch.uint8, device=self.device))
-            self.flat_union_find_table()
     
-    def flat_union_find_table(self) -> None:
-        """Initialize flattened union-find table for efficient group tracking"""
-        B, H, W = self.batch_size, self.board_size, self.board_size
-        N_squared = H * W
-    
-        # Create flattened union-find structure
-        # Shape: (batch_size, board_size*board_size, 3)
-        # Column 0: Colour (initialized to -1, for empty)
-        # Column 1: Parent
-        # Column 2: liberty count (initialized to 0)
-        self.register_buffer(
-        "flatten_union_find", 
-        torch.zeros((B, N_squared, 3), dtype=torch.int32, device=self.device)
-    )
-    
-            
-        # Initialize Colour (initialized to -1, for empty)
-        self.flatten_union_find[:, :, 0] = -1
-        
-        # Initialize parent indices to point to self
-        indices = torch.arange(N_squared, device=self.device)
-        self.flatten_union_find[:, :, 1] = indices.unsqueeze(0).expand(B, -1)
-
-    
-    # Liberty count starts at 0 (already zero from torch.zeros)
-        
-
     # ==================== CORE UTILITIES ====================
     
     @timed_method
@@ -231,16 +177,13 @@ class TensorBoard(torch.nn.Module):
     
     @timed_method
     def _update_hash_for_positions(self, positions: Tuple[Tensor, Tensor, Tensor], colors: Tensor):
-        """Update position hash for stone changes using unified table - OPTIMIZED"""
+        """Update position hash for stone changes (unified method)"""
         batch_idx, rows, cols = positions
+        flat_idx = coords_to_flat(rows, cols, self.board_size)
+        hash_values = self.zobrist_stones[colors].view(colors.shape[0], -1)
+        hash_values = hash_values.gather(1, flat_idx.unsqueeze(1)).squeeze(1)
         
-        # Direct computation using flattened table
-        flat_idx = rows * self.board_size + cols
-        
-        # Use the pre-flattened view for direct indexing
-        hash_values = self.zobrist_stones_flat[colors, flat_idx]
-        
-        # Batch update with XOR
+        # XOR is its own inverse, so same operation for add/remove
         self.position_hash[batch_idx] ^= hash_values
     
     @with_active_games
@@ -257,7 +200,6 @@ class TensorBoard(torch.nn.Module):
     def _invalidate_cache(self) -> None:
         """Clear cached values"""
         self._cache.clear()
-    
     
     # ==================== BOARD QUERIES ====================
     
@@ -312,29 +254,32 @@ class TensorBoard(torch.nn.Module):
     
     @timed_method
     def _detect_ko(self, captured_positions: Tuple[Tensor, Tensor, Tensor]) -> None:
-        """Detect and set ko points for single stone captures - OPTIMIZED"""
+        """Detect and set ko points for single stone captures"""
         batch_idx, rows, cols = captured_positions
         
-
+        if batch_idx.numel() == 0:
+            return
         
-        # Reset ko points
-        self.ko_points.fill_(-1)
+        # Count captures per batch using bincount
+        capture_counts = torch.bincount(batch_idx, minlength=self.batch_size)
         
-        # Set all potential ko points (last write wins naturally)
-        # No need for .to(torch.int8) since ko_points is already int8
-        self.ko_points[batch_idx, 0] = rows.to(torch.int8)
-        self.ko_points[batch_idx, 1] = cols.to(torch.int8)
-    
-        # Count captures using scatter_add
-        capture_counts = torch.zeros(self.batch_size, dtype=torch.int8, device=self.device)
-        capture_counts.scatter_add_(0, batch_idx, torch.ones_like(batch_idx, dtype=torch.int8))
-    
-        # Clear ko for games with != 1 capture
-        invalid_ko_mask = (capture_counts != 1)
-        self.ko_points[invalid_ko_mask] = -1
+        # Find batches with exactly one capture
+        single_capture_batches = (capture_counts == 1)
         
+        if not single_capture_batches.any():
+            return
         
-
+        # For batches with single captures, find index
+        batch_to_idx = torch.full((self.batch_size,), -1, dtype=torch.long, device=self.device)
+        idx_range = torch.arange(len(batch_idx), device=self.device)
+        batch_to_idx.scatter_(0, batch_idx, idx_range)
+        
+        # Extract positions for single capture batches
+        single_capture_idx = batch_to_idx[single_capture_batches]
+        
+        # Update ko points
+        self.ko_points[single_capture_batches, 0] = rows[single_capture_idx].to(torch.int8)
+        self.ko_points[single_capture_batches, 1] = cols[single_capture_idx].to(torch.int8)
     
     # ==================== LEGAL MOVES ====================
     
@@ -436,11 +381,9 @@ class TensorBoard(torch.nn.Module):
         
         # Handle captures
         self._process_captures(batch_idx, rows, cols)
-        
     
     @timed_method
     def _process_captures(self, batch_idx: Tensor, rows: Tensor, cols: Tensor) -> None:
-        
         """Remove captured opponent groups"""
         self.call_counts['_process_captures'] += 1
         
@@ -519,46 +462,44 @@ class TensorBoard(torch.nn.Module):
         white = self.stones[:, Stone.WHITE].sum(dim=(1, 2)).float()
         return torch.stack([black, white], dim=1)
     
-    # ==================== TIMING REPORTS ====================
     
-    def print_timing_report(self, top_n: int = 30) -> None:
-        """Print detailed timing report with enhanced statistics"""
+    def print_timing_report(self, top_n: int = 20) -> None:
+        """Print detailed timing report"""
         print("\n" + "="*80)
         print("TIMING REPORT")
         print("="*80)
         
-        # Convert to tensors for faster operations
-        timing_data = []
-        
+        # Aggregate timings
+        timing_summary = []
         for func_name, times in self.timings.items():
             if times:
-                times_tensor = torch.tensor(times, device='cpu')
-                timing_data.append({
-                    'name': func_name,
-                    'times': times_tensor,
-                    'total': times_tensor.sum().item(),
-                    'mean': times_tensor.mean().item(),
-                    'std': times_tensor.std().item() if len(times) > 1 else 0,
-                    'count': len(times),
-                    'min': times_tensor.min().item(),
-                    'max': times_tensor.max().item(),
+                total_time = sum(times)
+                avg_time = total_time / len(times)
+                count = len(times)
+                timing_summary.append({
+                    'function': func_name,
+                    'total_ms': total_time * 1000,
+                    'avg_ms': avg_time * 1000,
+                    'count': count,
+                    'percent': 0  # Will calculate after
                 })
         
-        # Sort by total time
-        timing_data.sort(key=lambda x: x['total'], reverse=True)
-        
         # Calculate percentages
-        total_time_all = sum(item['total'] for item in timing_data)
+        total_time_all = sum(item['total_ms'] for item in timing_summary)
+        for item in timing_summary:
+            item['percent'] = (item['total_ms'] / total_time_all * 100) if total_time_all > 0 else 0
         
-        # Print enhanced statistics
+        # Sort by total time
+        timing_summary.sort(key=lambda x: x['total_ms'], reverse=True)
+        
+        # Print top functions
         print(f"\nTop {top_n} Time-Consuming Functions:")
-        print(f"{'Function':<40} {'Total(ms)':<12} {'Avg(ms)':<12} {'Count':<10} {'%':<6}")
+        print(f"{'Function':<40} {'Total (ms)':<12} {'Avg (ms)':<12} {'Count':<10} {'%':<6}")
         print("-" * 80)
         
-        for item in timing_data[:top_n]:
-            percent = (item['total'] / total_time_all * 100) if total_time_all > 0 else 0
-            print(f"{item['name']:<40} {item['total']*1000:<12.2f} {item['mean']*1000:<12.4f} "
-                  f"{item['count']:<10} {percent:<6.1f}")
+        for item in timing_summary[:top_n]:
+            print(f"{item['function']:<40} {item['total_ms']:<12.2f} {item['avg_ms']:<12.4f} "
+                  f"{item['count']:<10} {item['percent']:<6.1f}")
         
         # Print call counts
         print(f"\n\nFunction Call Counts:")
@@ -576,69 +517,59 @@ class TensorBoard(torch.nn.Module):
             print(f"  Min iterations: {min(self.flood_fill_iterations)}")
             print(f"  Total iterations: {sum(self.flood_fill_iterations)}")
         
-        # Performance summary
-        self.print_performance_summary()
-    
-    def print_performance_summary(self):
-        """Print a visual performance summary"""
-        
+        # CPU-GPU Sync Analysis
         print("\n" + "="*80)
-        print("PERFORMANCE BOTTLENECK VISUALIZATION")
+        print("CPU-GPU SYNCHRONIZATION ANALYSIS")
         print("="*80)
         
-        # Get top bottlenecks
-        bottlenecks = []
-        for func_name, times in self.timings.items():
-            if times:
-                total_ms = sum(times) * 1000
-                bottlenecks.append((func_name, total_ms))
+        # Analyze code for sync patterns
+        sync_patterns = self._analyze_sync_patterns()
         
-        bottlenecks.sort(key=lambda x: x[1], reverse=True)
-        
-        # Visual bar chart
-        if bottlenecks:
-            max_time = bottlenecks[0][1]
-            bar_width = 50
+        if sync_patterns:
+            print("\nPotential CPU-GPU Sync Points:")
+            print(f"{'Function':<30} {'Sync Type':<20} {'Line/Pattern':<40}")
+            print("-" * 90)
             
-            print(f"\n{'Function':<35} {'Time (ms)':<12} {'Visual':<50}")
-            print("-" * 97)
-            
-            for func_name, total_ms in bottlenecks[:15]:
-                bar_length = int((total_ms / max_time) * bar_width)
-                bar = "█" * bar_length + "░" * (bar_width - bar_length)
-                print(f"{func_name:<35} {total_ms:<12.2f} {bar}")
+            for func_name, patterns in sync_patterns.items():
+                for pattern in patterns:
+                    print(f"{func_name:<30} {pattern['type']:<20} {pattern['pattern']:<40}")
         
-        # Key insights
-        print("\n\nKEY PERFORMANCE INSIGHTS:")
-        print("-" * 40)
-        
-        # Calculate where time is spent
-        total_time = sum(t[1] for t in bottlenecks) if bottlenecks else 1
-        move_time = sum(t[1] for t in bottlenecks if 'step' in t[0] or 'place' in t[0])
-        capture_time = sum(t[1] for t in bottlenecks if 'capture' in t[0] or 'remove' in t[0])
-        legal_time = sum(t[1] for t in bottlenecks if 'legal' in t[0])
-        hash_time = sum(t[1] for t in bottlenecks if 'hash' in t[0])
-        
-        print(f"Move execution: {move_time/total_time*100:.1f}% of time")
-        print(f"Capture processing: {capture_time/total_time*100:.1f}% of time")
-        print(f"Legal move computation: {legal_time/total_time*100:.1f}% of time")
-        print(f"Hash updates: {hash_time/total_time*100:.1f}% of time")
-        
-        # Optimization suggestions
-        print("\n\nOPTIMIZATION PRIORITIES:")
-        print("-" * 40)
-        
-        if hash_time / total_time > 0.05:
-            print("⚠️  Hash updates taking >5% of time - consider caching or batching")
-        
-        if capture_time / total_time > 0.20:
-            print("⚠️  Capture processing taking >20% of time - optimize flood fill")
-        
-        avg_flood_fill = sum(self.flood_fill_iterations) / len(self.flood_fill_iterations) if self.flood_fill_iterations else 0
-        if avg_flood_fill > 10:
-            print(f"⚠️  Flood fill averaging {avg_flood_fill:.1f} iterations - consider algorithm change")
+        print("\nSync-Safe Operations Used:")
+        safe_ops = [
+            "✓ .any() for boolean checks (instead of .item())",
+            "✓ .nonzero() returns GPU tensor",
+            "✓ Mask-based operations stay on GPU",
+            "✓ No Python loops over tensor elements"
+        ]
+        for op in safe_ops:
+            print(f"  {op}")
         
         print("\n" + "="*80)
+
+        """Analyze methods for CPU-GPU sync patterns"""
+        sync_patterns = {}
+        
+        # Known sync points in current code
+        problem_methods = {
+            '_detect_ko': [
+                {'type': '.numel()', 'pattern': 'batch_idx.numel() == 0'},
+                {'type': '.any()', 'pattern': 'if not has_ko.any()'},
+            ],
+            '_apply_ko_restrictions': [
+                {'type': '.any()', 'pattern': 'if not has_ko.any()'},
+            ],
+            '_process_captures': [
+                {'type': '.any()', 'pattern': 'if not seeds.any()'},
+                {'type': '.any()', 'pattern': 'if captured.any()'},
+            ],
+            '_flood_fill': [
+                {'type': '.any()', 'pattern': 'if not expanded.any()'},
+            ],
+            'legal_moves': [
+                {'type': '.any()', 'pattern': 'if not active_games.any()'},
+            ],
+        }
+ 
         """Analyze methods for CPU-GPU sync patterns"""
         sync_patterns = {}
         
@@ -665,22 +596,3 @@ class TensorBoard(torch.nn.Module):
         
         # Note: .any() is actually optimized by PyTorch, but it's good to track
         return problem_methods
-    
-    
-    def print_union_find_grid(self, batch_idx: int = 0, column: int = 0) -> None:
-        """Print union-find data in grid format
-        column: 0=Colour, 1=Parent, 2=Liberty
-        """
-        column_names = ["Colour", "Parent", "Liberty"]
-        print(f"\n{column_names[column]} values for batch {batch_idx}:")
-        print("-" * (self.board_size * 4 + 1))
-    
-        uf_data = self.flatten_union_find[batch_idx, :, column].view(self.board_size, self.board_size)
-    
-        for row in range(self.board_size):
-            row_str = "|"
-            for col in range(self.board_size):
-                value = uf_data[row, col].item()
-                row_str += f"{value:3}|"
-            print(row_str)
-        print("-" * (self.board_size * 4 + 1))
