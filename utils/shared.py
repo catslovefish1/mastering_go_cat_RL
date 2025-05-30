@@ -5,9 +5,17 @@ All utilities are self-contained and can be imported by any module.
 """
 
 from __future__ import annotations
+import time
+from collections import defaultdict
+from functools import wraps
+from typing import Tuple, Optional, TYPE_CHECKING, Dict, List, Callable
+
 import torch
 from torch import Tensor
-from typing import Tuple, Optional
+
+# Avoid circular imports
+if TYPE_CHECKING:
+    from engine.tensor_native import TensorBoard
 
 # ========================= DEVICE UTILITIES =========================
 
@@ -205,3 +213,282 @@ def scatter_first_occurrence(
     result.scatter_(0, batch_idx[reversed_idx], values[reversed_idx])
     
     return result
+
+# ========================= TIMING UTILITIES =========================
+
+class TimingContext:
+    """Context manager for timing operations with MPS synchronization"""
+    def __init__(self, timer_dict: Dict[str, List[float]], name: str, device: torch.device, enable_timing: bool = True):
+        self.timer_dict = timer_dict
+        self.name = name
+        self.device = device
+        self.start_time = None
+        self.enable_timing = enable_timing
+    
+    def __enter__(self):
+        if not self.enable_timing:
+            return self
+        if self.device.type == 'mps':
+            torch.mps.synchronize()  # Ensure previous operations are complete
+        self.start_time = time.perf_counter()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.enable_timing:
+            return
+        if self.device.type == 'mps':
+            torch.mps.synchronize()  # Ensure current operation is complete
+        elapsed = time.perf_counter() - self.start_time
+        self.timer_dict[self.name].append(elapsed)
+
+def timed_method(method: Callable) -> Callable:
+    """Decorator to time methods with MPS synchronization"""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        # Check if timing is enabled
+        if hasattr(self, 'enable_timing') and not self.enable_timing:
+            return method(self, *args, **kwargs)
+        
+        # Use TimingContext if the object has the required attributes
+        if hasattr(self, 'timings') and hasattr(self, 'device'):
+            with TimingContext(self.timings, method.__name__, self.device, getattr(self, 'enable_timing', True)):
+                return method(self, *args, **kwargs)
+        else:
+            # Fallback: just run the method without timing
+            return method(self, *args, **kwargs)
+    
+    return wrapper
+
+# ========================= PRINTING UTILITIES =========================
+
+def print_section_header(title: str, width: int = 80) -> None:
+    """Print a formatted section header."""
+    print("\n" + "=" * width)
+    print(title)
+    print("=" * width)
+
+def print_union_find_grid(board, batch_idx: int = 0, column: int = 0) -> None:
+    """Print union-find data in grid format
+    column: 0=Colour, 1=Parent, 2=Liberty
+    """
+    column_names = ["Colour", "Parent", "Liberty"]
+    print(f"\n{column_names[column]} values for batch {batch_idx}:")
+    print("-" * (board.board_size * 4 + 1))
+    
+    uf_data = board.flatten_union_find[batch_idx, :, column].view(board.board_size, board.board_size)
+    
+    for row in range(board.board_size):
+        row_str = "|"
+        for col in range(board.board_size):
+            value = uf_data[row, col].item()
+            row_str += f"{value:3}|"
+        print(row_str)
+    print("-" * (board.board_size * 4 + 1))
+
+def print_all_union_find_columns(board, batch_idx: int = 0, board_size_limit: int = 9) -> None:
+    """Print all union-find columns with appropriate formatting."""
+    # Always print colour
+    print("\nCOLOUR (-1=empty, 0=black, 1=white):")
+    print_union_find_grid(board, batch_idx, column=0)
+    
+    # Only print parent/liberty for small boards
+    if board.board_size <= board_size_limit:
+        print("\nPARENT INDICES:")
+        print_union_find_grid(board, batch_idx, column=1)
+        
+        print("\nLIBERTY COUNTS:")
+        print_union_find_grid(board, batch_idx, column=2)
+
+def print_move_info(move: Tensor, player: int) -> None:
+    """Print information about a move."""
+    player_name = "BLACK" if player == 0 else "WHITE"
+    print(f"\nCurrent player: {player_name} ({player})")
+    print(f"Move to be played: {move.tolist()}")
+    
+    if move[0] >= 0:  # Not a pass
+        print(f"  Position: row={move[0].item()}, col={move[1].item()}")
+    else:
+        print("  PASS MOVE")
+
+def print_game_state(board, batch_idx: int = 0, ply: int = 0, 
+                    header: str = "", move: Optional[Tensor] = None) -> None:
+    """Print complete game state for debugging.
+    
+    This is a high-level function that combines multiple printing utilities.
+    """
+    print_section_header(f"{header} - Ply {ply}")
+    
+    # Print move if provided
+    if move is not None:
+        print_move_info(move, board.current_player[batch_idx].item())
+    
+    # Print all union-find columns
+    print_all_union_find_columns(board, batch_idx)
+    
+    # Additional game info
+    print(f"\nPass count: {board.pass_count[batch_idx].item()}")
+    if board.ko_points[batch_idx, 0] >= 0:
+        ko_row = board.ko_points[batch_idx, 0].item()
+        ko_col = board.ko_points[batch_idx, 1].item()
+        print(f"Ko point: ({ko_row}, {ko_col})")
+
+def print_timing_report(board, top_n: int = 30) -> None:
+    """Print detailed timing report with enhanced statistics"""
+    print_section_header("TIMING REPORT")
+    
+    # Convert to tensors for faster operations
+    timing_data = []
+    
+    for func_name, times in board.timings.items():
+        if times:
+            times_tensor = torch.tensor(times, device='cpu')
+            timing_data.append({
+                'name': func_name,
+                'times': times_tensor,
+                'total': times_tensor.sum().item(),
+                'mean': times_tensor.mean().item(),
+                'std': times_tensor.std().item() if len(times) > 1 else 0,
+                'count': len(times),
+                'min': times_tensor.min().item(),
+                'max': times_tensor.max().item(),
+            })
+    
+    # Sort by total time
+    timing_data.sort(key=lambda x: x['total'], reverse=True)
+    
+    # Calculate percentages
+    total_time_all = sum(item['total'] for item in timing_data)
+    
+    # Print enhanced statistics
+    print(f"\nTop {top_n} Time-Consuming Functions:")
+    print(f"{'Function':<40} {'Total(ms)':<12} {'Avg(ms)':<12} {'Count':<10} {'%':<6}")
+    print("-" * 80)
+    
+    for item in timing_data[:top_n]:
+        percent = (item['total'] / total_time_all * 100) if total_time_all > 0 else 0
+        print(f"{item['name']:<40} {item['total']*1000:<12.2f} {item['mean']*1000:<12.4f} "
+              f"{item['count']:<10} {percent:<6.1f}")
+    
+    # Print call counts
+    print(f"\n\nFunction Call Counts:")
+    print(f"{'Function':<40} {'Calls':<10}")
+    print("-" * 50)
+    for func_name, count in sorted(board.call_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"{func_name:<40} {count:<10}")
+    
+    # Special statistics for flood fill iterations
+    if board.flood_fill_iterations:
+        print(f"\n\nFlood Fill Statistics:")
+        print(f"  Total flood fills: {len(board.flood_fill_iterations)}")
+        print(f"  Average iterations: {sum(board.flood_fill_iterations)/len(board.flood_fill_iterations):.2f}")
+        print(f"  Max iterations: {max(board.flood_fill_iterations)}")
+        print(f"  Min iterations: {min(board.flood_fill_iterations)}")
+        print(f"  Total iterations: {sum(board.flood_fill_iterations)}")
+
+def print_performance_metrics(elapsed: float, moves_made: int, num_games: int) -> None:
+    """Print performance metrics for a simulation run."""
+    print_section_header("PERFORMANCE METRICS")
+    print(f"Total simulation time: {elapsed:.2f} seconds")
+    print(f"Moves per second: {moves_made/elapsed:.1f}")
+    print(f"Games per second: {num_games/elapsed:.1f}")
+    print(f"Time per move: {elapsed/moves_made*1000:.2f} ms")
+    print(f"Time per game: {elapsed/num_games:.3f} seconds")
+
+def print_game_summary(stats) -> None:
+    """Print game statistics summary."""
+    print(
+        f"\nFinished {stats.total_games} games in {stats.duration_seconds:.2f}s "
+        f"({stats.seconds_per_move:.4f}s/ply)"
+    )
+    print(f"Black wins: {stats.black_wins:4d} ({stats.black_win_rate:6.1%})")
+    print(f"White wins: {stats.white_wins:4d} ({stats.white_win_rate:6.1%})")
+    print(f"Draws     : {stats.draws:4d} ({stats.draw_rate:6.1%})")
+    
+
+# Add this to utils/shared.py
+
+def save_game_histories_to_json(boards, num_games_to_save=5, output_dir="game_histories"):
+    """Save game histories to JSON files.
+    
+    Args:
+        boards: TensorBoard instance
+        num_games_to_save: Number of games to save (default: 5)
+        output_dir: Directory to save JSON files
+    """
+    import json
+    import os
+    import torch
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    history_size = boards.board_history.shape[1]
+    
+    for game_idx in range(min(num_games_to_save, boards.batch_size)):
+        num_moves = boards.move_count[game_idx].item()
+        available_moves = min(num_moves, history_size)
+        
+        # Build move sequence
+        moves = []
+        prev_board = torch.full((boards.board_size * boards.board_size,), -1, 
+                               dtype=torch.int8, device=boards.device)
+        
+        for move_num in range(available_moves):
+            curr_board = boards.board_history[game_idx, move_num]
+            diff = (curr_board != prev_board).nonzero(as_tuple=True)[0]
+            
+            move_info = {
+                "move_number": move_num + 1,
+                "board_state": curr_board.cpu().tolist(),
+                "changes": []
+            }
+            
+            # Identify what changed
+            for pos in diff:
+                flat_pos = pos.item()
+                row = flat_pos // boards.board_size
+                col = flat_pos % boards.board_size
+                old_val = prev_board[pos].item()
+                new_val = curr_board[pos].item()
+                
+                if old_val == -1 and new_val != -1:
+                    # Stone placed
+                    move_info["changes"].append({
+                        "type": "place",
+                        "position": [row, col],
+                        "color": "black" if new_val == 0 else "white"
+                    })
+                elif old_val != -1 and new_val == -1:
+                    # Stone captured
+                    move_info["changes"].append({
+                        "type": "capture",
+                        "position": [row, col],
+                        "color": "black" if old_val == 0 else "white"
+                    })
+            
+            if not move_info["changes"]:
+                move_info["changes"].append({"type": "pass"})
+            
+            moves.append(move_info)
+            prev_board = curr_board.clone()
+        
+        # Game summary
+        game_data = {
+            "game_id": game_idx,
+            "board_size": boards.board_size,
+            "total_moves": num_moves,
+            "moves_recorded": available_moves,
+            "truncated": num_moves > history_size,
+            "final_score": {
+                "black": int((boards.stones[game_idx, 0].sum().item())),
+                "white": int((boards.stones[game_idx, 1].sum().item()))
+            },
+            "moves": moves
+        }
+        
+        # Save to JSON
+        filename = os.path.join(output_dir, f"game_{game_idx:03d}.json")
+        with open(filename, 'w') as f:
+            json.dump(game_data, f, indent=2)
+    
+    print(f"Saved {min(num_games_to_save, boards.batch_size)} game histories to {output_dir}/")

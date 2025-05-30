@@ -30,7 +30,10 @@ from utils.shared import (
     create_pass_positions,
     is_pass_move,
     find_playable_games,
-    get_batch_indices
+    get_batch_indices,
+    print_union_find_grid,
+    TimingContext,  
+    timed_method,    
 )
 
 # Environment setup
@@ -52,7 +55,6 @@ PositionTensor = Tensor  # (B, 2)
 BatchTensor = Tensor  # (B,)
 
 # ========================= TIMING UTILITIES =========================
-
 class TimingContext:
     """Context manager for timing operations with MPS synchronization"""
     def __init__(self, timer_dict: Dict[str, List[float]], name: str, device: torch.device):
@@ -73,13 +75,7 @@ class TimingContext:
         elapsed = time.perf_counter() - self.start_time
         self.timer_dict[self.name].append(elapsed)
 
-def timed_method(method: Callable) -> Callable:
-    """Decorator to time methods with MPS synchronization"""
-    @wraps(method)
-    def wrapper(self, *args, **kwargs):
-        with TimingContext(self.timings, method.__name__, self.device):
-            return method(self, *args, **kwargs)
-    return wrapper
+
 
 # ========================= DECORATORS =========================
 
@@ -113,6 +109,7 @@ class TensorBoard(torch.nn.Module):
         self.board_size = board_size
         self.device = device or select_device()
         self.enable_timing = enable_timing
+        
         
         # Timing storage
         self.timings: Dict[str, List[float]] = defaultdict(list)
@@ -182,6 +179,16 @@ class TensorBoard(torch.nn.Module):
             self.register_buffer("ko_points", torch.full((B, 2), -1, dtype=torch.int8, device=self.device))
             self.register_buffer("pass_count", torch.zeros(B, dtype=torch.uint8, device=self.device))
             self.flat_union_find_table()
+            
+            # ADD: Simple board history
+             # Shape: (batch_size, max_moves, board_size * board_size)
+            # Stores flattened board state: -1=empty, 0=black, 1=white
+            max_moves = self.board_size * self.board_size * 10
+            self.register_buffer(
+            "board_history", 
+            torch.full((B, max_moves, H * W), -1, dtype=torch.int8, device=self.device)
+            )
+            self.register_buffer("move_count", torch.zeros(B, dtype=torch.int32, device=self.device))
     
     def flat_union_find_table(self) -> None:
         """Initialize flattened union-find table for efficient group tracking"""
@@ -292,6 +299,12 @@ class TensorBoard(torch.nn.Module):
         
         return find_playable_games(legal_moves)
     
+    
+    def get_current_flat_union_table(self) -> Tensor:
+         """Get current flattened union-find table without updating"""
+         return self.flatten_union_find.clone()
+         
+         
     # ==================== KO HANDLING ====================
     
     @timed_method
@@ -388,9 +401,54 @@ class TensorBoard(torch.nn.Module):
         return self.empty_mask & (self._count_neighbors(vulnerable) > 0)
     
     # ==================== MOVE EXECUTION ====================
+
+    # Add simple update method:
+    def _update_board_history(self, active_mask: BatchTensor) -> None:
+        """Update board history for active games"""
+        if not active_mask.any():
+            return
     
+        active_idx = active_mask.nonzero(as_tuple=True)[0]
+        move_idx = self.move_count[active_idx].long()
+    
+        # Convert current board state to history format
+        # black=0, white=1, empty=-1
+        black_flat = self.stones[active_idx, 0].flatten(1, 2)  # (active_games, H*W)
+        white_flat = self.stones[active_idx, 1].flatten(1, 2)
+    
+        board_state = torch.full_like(black_flat, -1, dtype=torch.int8)
+        board_state[black_flat] = 0
+        board_state[white_flat] = 1
+    
+        self.board_history[active_idx, move_idx] = board_state
+        
     @timed_method
     def step(self, positions: PositionTensor) -> None:
+        """Execute moves for all games (with union-find printing)"""
+    
+        # # Print union-find table before move
+        # print("\n" + "="*60)
+        # # print("BEFORE MOVE - UNION-FIND STATE")
+        # print("="*60)
+    
+        # # Print for first batch
+        # batch_idx = 0
+        # print(f"\nMove to be played at position: {positions[batch_idx].tolist()}")
+    
+        # Call the function from utils, passing self as the board parameter
+        # print_union_find_grid(self, batch_idx, column=0)  # Print Colour
+    
+        # After all moves are executed, before incrementing move count:
+        # Record board state
+        active = ~self.is_game_over()
+        self._update_board_history(active)
+      
+        # Increment move count
+        self.move_count[active] += 1
+        
+        
+        
+        
         """Execute moves for all games"""
         self._invalidate_cache()
         
@@ -521,166 +579,12 @@ class TensorBoard(torch.nn.Module):
     
     # ==================== TIMING REPORTS ====================
     
+    
+    # Add this single method to your TensorBoard class (at the end):
+
     def print_timing_report(self, top_n: int = 30) -> None:
-        """Print detailed timing report with enhanced statistics"""
-        print("\n" + "="*80)
-        print("TIMING REPORT")
-        print("="*80)
-        
-        # Convert to tensors for faster operations
-        timing_data = []
-        
-        for func_name, times in self.timings.items():
-            if times:
-                times_tensor = torch.tensor(times, device='cpu')
-                timing_data.append({
-                    'name': func_name,
-                    'times': times_tensor,
-                    'total': times_tensor.sum().item(),
-                    'mean': times_tensor.mean().item(),
-                    'std': times_tensor.std().item() if len(times) > 1 else 0,
-                    'count': len(times),
-                    'min': times_tensor.min().item(),
-                    'max': times_tensor.max().item(),
-                })
-        
-        # Sort by total time
-        timing_data.sort(key=lambda x: x['total'], reverse=True)
-        
-        # Calculate percentages
-        total_time_all = sum(item['total'] for item in timing_data)
-        
-        # Print enhanced statistics
-        print(f"\nTop {top_n} Time-Consuming Functions:")
-        print(f"{'Function':<40} {'Total(ms)':<12} {'Avg(ms)':<12} {'Count':<10} {'%':<6}")
-        print("-" * 80)
-        
-        for item in timing_data[:top_n]:
-            percent = (item['total'] / total_time_all * 100) if total_time_all > 0 else 0
-            print(f"{item['name']:<40} {item['total']*1000:<12.2f} {item['mean']*1000:<12.4f} "
-                  f"{item['count']:<10} {percent:<6.1f}")
-        
-        # Print call counts
-        print(f"\n\nFunction Call Counts:")
-        print(f"{'Function':<40} {'Calls':<10}")
-        print("-" * 50)
-        for func_name, count in sorted(self.call_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"{func_name:<40} {count:<10}")
-        
-        # Special statistics for flood fill iterations
-        if self.flood_fill_iterations:
-            print(f"\n\nFlood Fill Statistics:")
-            print(f"  Total flood fills: {len(self.flood_fill_iterations)}")
-            print(f"  Average iterations: {sum(self.flood_fill_iterations)/len(self.flood_fill_iterations):.2f}")
-            print(f"  Max iterations: {max(self.flood_fill_iterations)}")
-            print(f"  Min iterations: {min(self.flood_fill_iterations)}")
-            print(f"  Total iterations: {sum(self.flood_fill_iterations)}")
-        
-        # Performance summary
-        self.print_performance_summary()
-    
-    def print_performance_summary(self):
-        """Print a visual performance summary"""
-        
-        print("\n" + "="*80)
-        print("PERFORMANCE BOTTLENECK VISUALIZATION")
-        print("="*80)
-        
-        # Get top bottlenecks
-        bottlenecks = []
-        for func_name, times in self.timings.items():
-            if times:
-                total_ms = sum(times) * 1000
-                bottlenecks.append((func_name, total_ms))
-        
-        bottlenecks.sort(key=lambda x: x[1], reverse=True)
-        
-        # Visual bar chart
-        if bottlenecks:
-            max_time = bottlenecks[0][1]
-            bar_width = 50
-            
-            print(f"\n{'Function':<35} {'Time (ms)':<12} {'Visual':<50}")
-            print("-" * 97)
-            
-            for func_name, total_ms in bottlenecks[:15]:
-                bar_length = int((total_ms / max_time) * bar_width)
-                bar = "█" * bar_length + "░" * (bar_width - bar_length)
-                print(f"{func_name:<35} {total_ms:<12.2f} {bar}")
-        
-        # Key insights
-        print("\n\nKEY PERFORMANCE INSIGHTS:")
-        print("-" * 40)
-        
-        # Calculate where time is spent
-        total_time = sum(t[1] for t in bottlenecks) if bottlenecks else 1
-        move_time = sum(t[1] for t in bottlenecks if 'step' in t[0] or 'place' in t[0])
-        capture_time = sum(t[1] for t in bottlenecks if 'capture' in t[0] or 'remove' in t[0])
-        legal_time = sum(t[1] for t in bottlenecks if 'legal' in t[0])
-        hash_time = sum(t[1] for t in bottlenecks if 'hash' in t[0])
-        
-        print(f"Move execution: {move_time/total_time*100:.1f}% of time")
-        print(f"Capture processing: {capture_time/total_time*100:.1f}% of time")
-        print(f"Legal move computation: {legal_time/total_time*100:.1f}% of time")
-        print(f"Hash updates: {hash_time/total_time*100:.1f}% of time")
-        
-        # Optimization suggestions
-        print("\n\nOPTIMIZATION PRIORITIES:")
-        print("-" * 40)
-        
-        if hash_time / total_time > 0.05:
-            print("⚠️  Hash updates taking >5% of time - consider caching or batching")
-        
-        if capture_time / total_time > 0.20:
-            print("⚠️  Capture processing taking >20% of time - optimize flood fill")
-        
-        avg_flood_fill = sum(self.flood_fill_iterations) / len(self.flood_fill_iterations) if self.flood_fill_iterations else 0
-        if avg_flood_fill > 10:
-            print(f"⚠️  Flood fill averaging {avg_flood_fill:.1f} iterations - consider algorithm change")
-        
-        print("\n" + "="*80)
-        """Analyze methods for CPU-GPU sync patterns"""
-        sync_patterns = {}
-        
-        # Known sync points in current code
-        problem_methods = {
-            '_detect_ko': [
-                {'type': '.numel()', 'pattern': 'batch_idx.numel() == 0'},
-                {'type': '.any()', 'pattern': 'if not has_ko.any()'},
-            ],
-            '_apply_ko_restrictions': [
-                {'type': '.any()', 'pattern': 'if not has_ko.any()'},
-            ],
-            '_process_captures': [
-                {'type': '.any()', 'pattern': 'if not seeds.any()'},
-                {'type': '.any()', 'pattern': 'if captured.any()'},
-            ],
-            '_flood_fill': [
-                {'type': '.any()', 'pattern': 'if not expanded.any()'},
-            ],
-            'legal_moves': [
-                {'type': '.any()', 'pattern': 'if not active_games.any()'},
-            ],
-        }
-        
-        # Note: .any() is actually optimized by PyTorch, but it's good to track
-        return problem_methods
-    
-    
-    def print_union_find_grid(self, batch_idx: int = 0, column: int = 0) -> None:
-        """Print union-find data in grid format
-        column: 0=Colour, 1=Parent, 2=Liberty
-        """
-        column_names = ["Colour", "Parent", "Liberty"]
-        print(f"\n{column_names[column]} values for batch {batch_idx}:")
-        print("-" * (self.board_size * 4 + 1))
-    
-        uf_data = self.flatten_union_find[batch_idx, :, column].view(self.board_size, self.board_size)
-    
-        for row in range(self.board_size):
-            row_str = "|"
-            for col in range(self.board_size):
-                value = uf_data[row, col].item()
-                row_str += f"{value:3}|"
-            print(row_str)
-        print("-" * (self.board_size * 4 + 1))
+        """Wrapper to call shared timing report."""
+        if self.enable_timing:
+            from utils.shared import print_timing_report
+        print_timing_report(self, top_n)
+   

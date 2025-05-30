@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Go Game Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        
+        .game-selector {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        
+        .game-selector button {
+            margin: 0 5px;
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        
+        .game-selector button:hover {
+            background-color: #45a049;
+        }
+        
+        .game-selector button.active {
+            background-color: #2196F3;
+        }
+        
+        .board-container {
+            display: flex;
+            justify-content: center;
+            margin: 20px 0;
+        }
+        
+        .board-wrapper {
+            background-color: #DEB887;
+            padding: 30px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+        
+        .board {
+            position: relative;
+            background-color: #F5DEB3;
+            border: 2px solid #8B4513;
+        }
+        
+        .intersection {
+            position: absolute;
+            width: 36px;
+            height: 36px;
+            cursor: pointer;
+        }
+        
+        .stone {
+            position: absolute;
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            top: 1px;
+            left: 1px;
+            box-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .stone.black {
+            background-color: #000;
+            background-image: radial-gradient(circle at 30% 30%, #333, #000);
+        }
+        
+        .stone.white {
+            background-color: #fff;
+            background-image: radial-gradient(circle at 30% 30%, #fff, #ddd);
+            border: 1px solid #333;
+        }
+        
+        .last-move-marker {
+            position: absolute;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            top: 13px;
+            left: 13px;
+            background-color: red;
+        }
+        
+        .grid-line-h {
+            position: absolute;
+            height: 1px;
+            background-color: #8B4513;
+            left: 18px;
+        }
+        
+        .grid-line-v {
+            position: absolute;
+            width: 1px;
+            background-color: #8B4513;
+            top: 18px;
+        }
+        
+        .star-point {
+            position: absolute;
+            width: 6px;
+            height: 6px;
+            background-color: #8B4513;
+            border-radius: 50%;
+            margin-left: -3px;
+            margin-top: -3px;
+        }
+        
+        .coord {
+            position: absolute;
+            font-size: 14px;
+            font-weight: bold;
+            color: #666;
+        }
+        
+        .coord-h {
+            top: -25px;
+            width: 36px;
+            text-align: center;
+        }
+        
+        .coord-v {
+            left: -25px;
+            height: 36px;
+            line-height: 36px;
+            text-align: center;
+        }
+        
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        
+        .controls button {
+            margin: 0 5px;
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #008CBA;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        
+        .controls button:hover {
+            background-color: #007399;
+        }
+        
+        .controls button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .info {
+            text-align: center;
+            margin: 20px 0;
+            font-size: 18px;
+        }
+        
+        .slider-container {
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .slider {
+            width: 80%;
+            margin: 10px 0;
+        }
+        
+        .speed-control {
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .error {
+            color: red;
+            text-align: center;
+            padding: 10px;
+            background-color: #ffe0e0;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Go Game Viewer</h1>
+        
+        <div class="game-selector">
+            <button onclick="loadGame(0)" class="active">Game 000</button>
+            <button onclick="loadGame(1)">Game 001</button>
+            <button onclick="loadGame(2)">Game 002</button>
+            <button onclick="loadGame(3)">Game 003</button>
+            <button onclick="loadGame(4)">Game 004</button>
+        </div>
+        
+        <div id="error-message" class="error" style="display: none;"></div>
+        
+        <div class="info">
+            <div>Move: <span id="current-move">0</span> / <span id="total-moves">0</span></div>
+            <div>Black: <span id="black-score">0</span> | White: <span id="white-score">0</span></div>
+        </div>
+        
+        <div class="board-container">
+            <div class="board-wrapper">
+                <div id="board" class="board"></div>
+            </div>
+        </div>
+        
+        <div class="slider-container">
+            <input type="range" id="move-slider" class="slider" min="0" max="0" value="0">
+        </div>
+        
+        <div class="controls">
+            <button onclick="resetGame()">⏮ Reset</button>
+            <button onclick="previousMove()">◀ Previous</button>
+            <button onclick="togglePlay()" id="play-button">▶ Play</button>
+            <button onclick="nextMove()">Next ▶</button>
+            <button onclick="endGame()">End ⏭</button>
+        </div>
+        
+        <div class="speed-control">
+            <label>Speed: <span id="speed-value">500</span>ms</label><br>
+            <input type="range" id="speed-slider" min="100" max="2000" step="100" value="500">
+        </div>
+    </div>
+
+    <script>
+        let gameData = null;
+        let currentMove = 0;
+        let isPlaying = false;
+        let playInterval = null;
+        let playSpeed = 500;
+        let currentGameId = 0;
+
+        // Initialize
+        document.getElementById('speed-slider').addEventListener('input', (e) => {
+            playSpeed = parseInt(e.target.value);
+            document.getElementById('speed-value').textContent = playSpeed;
+            if (isPlaying) {
+                stopPlay();
+                startPlay();
+            }
+        });
+
+        document.getElementById('move-slider').addEventListener('input', (e) => {
+            currentMove = parseInt(e.target.value);
+            updateBoard();
+        });
+
+        // Load game from local file
+        async function loadGame(gameId) {
+            currentGameId = gameId;
+            const filename = `../game_histories/game_${gameId.toString().padStart(3, '0')}.json`;
+            
+            try {
+                // Update active button
+                document.querySelectorAll('.game-selector button').forEach(btn => {
+                    btn.classList.remove('active');
+                });
+                event.target.classList.add('active');
+                
+                const response = await fetch(filename);
+                if (!response.ok) {
+                    throw new Error(`Failed to load ${filename}`);
+                }
+                
+                gameData = await response.json();
+                currentMove = 0;
+                stopPlay();
+                initializeBoard();
+                updateBoard();
+                
+                document.getElementById('error-message').style.display = 'none';
+            } catch (error) {
+                console.error('Error loading game:', error);
+                showError(`Failed to load game file. Make sure you're running this from a web server and the file exists at: ${filename}`);
+            }
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error-message');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+
+        function initializeBoard() {
+            if (!gameData) return;
+            
+            const board = document.getElementById('board');
+            const size = gameData.board_size;
+            const cellSize = 36;
+            
+            // Set board size
+            board.style.width = `${(size - 1) * cellSize + 36}px`;
+            board.style.height = `${(size - 1) * cellSize + 36}px`;
+            board.innerHTML = '';
+            
+            // Draw grid lines
+            for (let i = 0; i < size; i++) {
+                // Horizontal lines
+                const hLine = document.createElement('div');
+                hLine.className = 'grid-line-h';
+                hLine.style.top = `${i * cellSize + 18}px`;
+                hLine.style.width = `${(size - 1) * cellSize}px`;
+                board.appendChild(hLine);
+                
+                // Vertical lines
+                const vLine = document.createElement('div');
+                vLine.className = 'grid-line-v';
+                vLine.style.left = `${i * cellSize + 18}px`;
+                vLine.style.height = `${(size - 1) * cellSize}px`;
+                board.appendChild(vLine);
+            }
+            
+            // Add star points for 9x9 board
+            if (size === 9) {
+                const starPoints = [[2,2], [2,6], [6,2], [6,6], [4,4]];
+                starPoints.forEach(([row, col]) => {
+                    const star = document.createElement('div');
+                    star.className = 'star-point';
+                    star.style.left = `${col * cellSize + 18}px`;
+                    star.style.top = `${row * cellSize + 18}px`;
+                    board.appendChild(star);
+                });
+            }
+            
+            // Add coordinates
+            for (let i = 0; i < size; i++) {
+                // Top coordinates
+                const topCoord = document.createElement('div');
+                topCoord.className = 'coord coord-h';
+                topCoord.textContent = String.fromCharCode(65 + i);
+                topCoord.style.left = `${i * cellSize}px`;
+                board.appendChild(topCoord);
+                
+                // Left coordinates
+                const leftCoord = document.createElement('div');
+                leftCoord.className = 'coord coord-v';
+                leftCoord.textContent = size - i;
+                leftCoord.style.top = `${i * cellSize}px`;
+                board.appendChild(leftCoord);
+            }
+            
+            // Create intersection divs for stones
+            for (let row = 0; row < size; row++) {
+                for (let col = 0; col < size; col++) {
+                    const intersection = document.createElement('div');
+                    intersection.className = 'intersection';
+                    intersection.dataset.row = row;
+                    intersection.dataset.col = col;
+                    intersection.style.left = `${col * cellSize}px`;
+                    intersection.style.top = `${row * cellSize}px`;
+                    board.appendChild(intersection);
+                }
+            }
+            
+            // Update slider and info
+            document.getElementById('move-slider').max = gameData.moves.length;
+            document.getElementById('total-moves').textContent = gameData.total_moves;
+            document.getElementById('black-score').textContent = gameData.final_score.black;
+            document.getElementById('white-score').textContent = gameData.final_score.white;
+        }
+
+        function updateBoard() {
+            if (!gameData) return;
+            
+            // Clear all stones
+            document.querySelectorAll('.stone, .last-move-marker').forEach(el => el.remove());
+            
+            // Get current board state
+            const boardState = currentMove > 0 ? 
+                gameData.moves[currentMove - 1].board_state : 
+                new Array(gameData.board_size * gameData.board_size).fill(-1);
+            
+            // Track last move position
+            let lastMovePos = null;
+            if (currentMove > 0) {
+                const changes = gameData.moves[currentMove - 1].changes;
+                const placeChange = changes.find(c => c.type === 'place');
+                if (placeChange) {
+                    lastMovePos = placeChange.position;
+                }
+            }
+            
+            // Place stones
+            boardState.forEach((value, index) => {
+                if (value !== -1) {
+                    const row = Math.floor(index / gameData.board_size);
+                    const col = index % gameData.board_size;
+                    const intersection = document.querySelector(`[data-row="${row}"][data-col="${col}"]`);
+                    
+                    const stone = document.createElement('div');
+                    stone.className = `stone ${value === 0 ? 'black' : 'white'}`;
+                    intersection.appendChild(stone);
+                    
+                    // Add last move marker
+                    if (lastMovePos && lastMovePos[0] === row && lastMovePos[1] === col) {
+                        const marker = document.createElement('div');
+                        marker.className = 'last-move-marker';
+                        intersection.appendChild(marker);
+                    }
+                }
+            });
+            
+            // Update UI
+            document.getElementById('current-move').textContent = currentMove;
+            document.getElementById('move-slider').value = currentMove;
+        }
+
+        function nextMove() {
+            if (gameData && currentMove < gameData.moves.length) {
+                currentMove++;
+                updateBoard();
+            }
+        }
+
+        function previousMove() {
+            if (currentMove > 0) {
+                currentMove--;
+                updateBoard();
+            }
+        }
+
+        function resetGame() {
+            currentMove = 0;
+            updateBoard();
+            stopPlay();
+        }
+
+        function endGame() {
+            if (gameData) {
+                currentMove = gameData.moves.length;
+                updateBoard();
+                stopPlay();
+            }
+        }
+
+        function togglePlay() {
+            if (isPlaying) {
+                stopPlay();
+            } else {
+                startPlay();
+            }
+        }
+
+        function startPlay() {
+            if (!gameData || currentMove >= gameData.moves.length) return;
+            
+            isPlaying = true;
+            document.getElementById('play-button').textContent = '⏸ Pause';
+            
+            playInterval = setInterval(() => {
+                if (currentMove >= gameData.moves.length) {
+                    stopPlay();
+                } else {
+                    nextMove();
+                }
+            }, playSpeed);
+        }
+
+        function stopPlay() {
+            isPlaying = false;
+            document.getElementById('play-button').textContent = '▶ Play';
+            if (playInterval) {
+                clearInterval(playInterval);
+                playInterval = null;
+            }
+        }
+
+        // Load first game on startup
+        window.onload = () => {
+            loadGame(0);
+        };
+    </script>
+</body>
+</html>
