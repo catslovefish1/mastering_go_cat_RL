@@ -424,8 +424,22 @@ class TensorBoard(torch.nn.Module):
         
     @timed_method
     def step(self, positions: PositionTensor) -> None:
-
-        # update board history
+        """Execute moves for all games (with union-find printing)"""
+    
+        # # Print union-find table before move
+        # print("\n" + "="*60)
+        # # print("BEFORE MOVE - UNION-FIND STATE")
+        # print("="*60)
+    
+        # # Print for first batch
+        # batch_idx = 0
+        # print(f"\nMove to be played at position: {positions[batch_idx].tolist()}")
+    
+        # Call the function from utils, passing self as the board parameter
+        # print_union_find_grid(self, batch_idx, column=0)  # Print Colour
+    
+        # After all moves are executed, before incrementing move count:
+        # Record board state
         active = ~self.is_game_over()
         self._update_board_history(active)
       
@@ -435,7 +449,7 @@ class TensorBoard(torch.nn.Module):
         
         
         
-        """Main logic to Execute moves for all games"""
+        """Execute moves for all games"""
         self._invalidate_cache()
         
         # Classify moves
@@ -504,55 +518,12 @@ class TensorBoard(torch.nn.Module):
         
         # Flood fill to find complete groups
         with TimingContext(self.timings, '_process_captures.flood_fill', self.device):
-            
             groups = self._flood_fill(seeds, opponent_stones)
         
         # Find captured groups
         with TimingContext(self.timings, '_process_captures.find_captured', self.device):
-            # Find all positions adjacent to ANY stone in each group
-            captured = torch.zeros_like(opponent_stones)
-            
-            # For each batch
-            for b in range(self.batch_size):
-                if not seeds[b].any():
-                    continue
-                
-                # Find all seed positions (opponent stones adjacent to our move)
-                seed_positions = seeds[b].nonzero(as_tuple=False)
-                already_processed = torch.zeros_like(seeds[b], dtype=torch.bool)
-                
-                # Check each seed position - it might belong to a different group!
-                for seed_idx in range(len(seed_positions)):
-                    seed_r = seed_positions[seed_idx, 0]
-                    seed_c = seed_positions[seed_idx, 1]
-                    
-                    # Skip if this stone was already processed as part of another group
-                    if already_processed[seed_r, seed_c]:
-                        continue
-                    
-                    
-                    # Find the complete group starting from this single seed
-                    single_seed = torch.zeros_like(seeds[b])
-                    single_seed[seed_r, seed_c] = True
-                    
-                    
-                    # Flood fill from just this one seed
-                    current_group = self._flood_fill(
-                        single_seed.unsqueeze(0), 
-                        opponent_stones[b].unsqueeze(0)
-                    ).squeeze(0)
-                    
-                     # Mark all stones in this group as processed
-                    already_processed |= current_group
-                    
-                    # Check if THIS SPECIFIC group has liberties
-                    group_adjacent = self._count_neighbors(current_group.unsqueeze(0).float()).squeeze(0) > 0
-                    group_has_liberties = (group_adjacent & self.empty_mask[b]).any()
-                    
-                    # If no liberties, capture this group
-                    if not group_has_liberties:
-                        captured[b] |= current_group
-                
+            group_liberties = self._count_neighbors(self.empty_mask) * groups
+            captured = groups & (group_liberties == 0)
         
         if captured.any():
             self._remove_captured_stones(captured)

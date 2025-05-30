@@ -34,7 +34,7 @@ def simulate_batch_games(
         finished = boards.is_game_over()
         ply = 0
         
-        while not finished.all() and ply < board_size * board_size * 2:
+        while not finished.all() and ply < board_size * board_size * 4:
             boards.step(bot.select_moves(boards))
             finished |= boards.is_game_over()
             ply += 1
@@ -73,9 +73,9 @@ def simulate_batch_games(
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=100,
-        board_size=19,
-        show_boards=0,
+        num_games=10,
+        board_size=11,
+        show_boards=2,
         enable_timing=False,
         save_history=True,
         num_games_to_save=5  # Save first 5 games
