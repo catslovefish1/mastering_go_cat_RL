@@ -210,7 +210,7 @@ def main() -> None:
         num_games=1,  # 512 games
         board_size=7,     # 9x9 board
         show_boards=2,    # Don't show boards
-        log_interval=64,  # Log every 64 moves
+        log_interval=1,  # Log every 64 moves
         enable_timing=True  # Enable timing
     )
 

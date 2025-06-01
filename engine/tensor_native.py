@@ -1,21 +1,10 @@
-"""tensor_native.py - Optimized Go engine with timing instrumentation.
-
-Key improvements:
-1. Uses centralized utilities from utils.shared
-2. Cleaner separation of concerns
-3. More functional programming style
-4. Comprehensive timing instrumentation for MPS performance analysis
-5. Optimized hash updates with unified Zobrist table
-6. Improved ko detection without CPU-GPU sync
-7. Enhanced timing report with percentiles and visualizations
+"""tensor_native.py - Optimized Go engine. union_find_version
 """
 
 from __future__ import annotations
 import os
-import time
-from typing import Tuple, Optional, Callable, Dict, List
+from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass
-from functools import wraps
 from collections import defaultdict
 
 import torch
@@ -25,15 +14,8 @@ from torch import Tensor
 # Import shared utilities
 from utils.shared import (
     select_device,
-    flat_to_2d,
-    coords_to_flat,
-    create_pass_positions,
     is_pass_move,
-    find_playable_games,
     get_batch_indices,
-    print_union_find_grid,
-    TimingContext,  
-    timed_method,    
 )
 
 # Environment setup
@@ -44,6 +26,7 @@ os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
 @dataclass(frozen=True)
 class Stone:
+    """Stone color constants"""
     BLACK: int = 0
     WHITE: int = 1
     EMPTY: int = -1
@@ -54,230 +37,98 @@ StoneTensor = Tensor  # (B, C, H, W)
 PositionTensor = Tensor  # (B, 2)
 BatchTensor = Tensor  # (B,)
 
-# ========================= TIMING UTILITIES =========================
-class TimingContext:
-    """Context manager for timing operations with MPS synchronization"""
-    def __init__(self, timer_dict: Dict[str, List[float]], name: str, device: torch.device):
-        self.timer_dict = timer_dict
-        self.name = name
-        self.device = device
-        self.start_time = None
-    
-    def __enter__(self):
-        if self.device.type == 'mps':
-            torch.mps.synchronize()  # Ensure previous operations are complete
-        self.start_time = time.perf_counter()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.device.type == 'mps':
-            torch.mps.synchronize()  # Ensure current operation is complete
-        elapsed = time.perf_counter() - self.start_time
-        self.timer_dict[self.name].append(elapsed)
-
-
-
-# ========================= DECORATORS =========================
-
-def with_active_games(method: Callable) -> Callable:
-    """Decorator to handle active game filtering"""
-    @wraps(method)
-    def wrapper(self, *args, active_mask: Optional[BatchTensor] = None, **kwargs):
-        if active_mask is None:
-            active_mask = ~self.is_game_over()
-        
-        if not active_mask.any():
-            return None
-            
-        return method(self, *args, active_mask=active_mask, **kwargs)
-    return wrapper
-
 # ========================= GO ENGINE =========================
 
 class TensorBoard(torch.nn.Module):
-    """Elegant vectorized Go board implementation with timing instrumentation"""
+    """Elegant vectorized Go board implementation"""
     
     def __init__(
         self,
         batch_size: int = 1,
         board_size: int = 19,
+        history_factor: int = 10,  # Controls history depth (board_size² × history_factor)
         device: Optional[torch.device] = None,
         enable_timing: bool = True,
     ) -> None:
         super().__init__()
         self.batch_size = batch_size
         self.board_size = board_size
+        self.history_factor = history_factor
         self.device = device or select_device()
         self.enable_timing = enable_timing
         
-        
-        # Timing storage
-        self.timings: Dict[str, List[float]] = defaultdict(list)
-        self.call_counts: Dict[str, int] = defaultdict(int)
-        self.flood_fill_iterations: List[int] = []  # Separate storage for iteration counts
-        
-        # CPU-GPU sync tracking
-        self.sync_points: Dict[str, Dict] = {}  # Static analysis results
-        self.sync_warnings: Dict[str, int] = defaultdict(int)  # Runtime warnings
-        
+        self._init_zobrist_table()
         self._init_constants()
         self._init_state()
         self._cache = {}
     
-    def _init_constants(self) -> None:
-        """Initialize constant tensors"""
-        with TimingContext(self.timings, '_init_constants', self.device):
-            # Neighbor kernel for convolutions
-            kernel = torch.tensor([[0, 1, 0], [1, 0, 1], [0, 1, 0]], 
-                                dtype=torch.float32, device=self.device)
-            self.register_buffer("neighbor_kernel", kernel.unsqueeze(0).unsqueeze(0))
-            
-            # Unified Zobrist hashing
-            self._init_zobrist_table()
     
-    def _init_zobrist_table(self) -> None:
-        """Initialize unified Zobrist hash table"""
-        torch.manual_seed(42)
-        max_hash = torch.iinfo(torch.int64).max
-        
-        # Total elements needed:
-        # - 2 * board_size * board_size for stones (black and white)
-        # - 2 for turn (black's turn, white's turn)
-        total_elements = 2 * self.board_size * self.board_size + 2
-        
-        # Create flat unified table
-        self.register_buffer(
-            "zobrist_unified", 
-            torch.randint(0, max_hash, (total_elements,), dtype=torch.int64, device=self.device)
-        )
-        
-        # Define indices for different components
-        stones_end = 2 * self.board_size * self.board_size
-        
-        # Create views for easier access
-        self.register_buffer(
-            "zobrist_stones_flat",
-            self.zobrist_unified[:stones_end].view(2, self.board_size * self.board_size)
-        )
-        self.register_buffer(
-            "zobrist_stones",
-            self.zobrist_unified[:stones_end].view(2, self.board_size, self.board_size)
-        )
-        self.register_buffer(
-            "zobrist_turn",
-            self.zobrist_unified[stones_end:stones_end + 2]
-        )
-    
+
+
     def _init_state(self) -> None:
         """Initialize mutable game state"""
-        with TimingContext(self.timings, '_init_state', self.device):
-            B, H, W = self.batch_size, self.board_size, self.board_size
-            
-            self.register_buffer("stones", torch.zeros((B, 2, H, W), dtype=torch.bool, device=self.device))
-            self.register_buffer("current_player", torch.zeros(B, dtype=torch.uint8, device=self.device))
-            self.register_buffer("position_hash", torch.zeros(B, dtype=torch.int64, device=self.device))
-            self.register_buffer("ko_points", torch.full((B, 2), -1, dtype=torch.int8, device=self.device))
-            self.register_buffer("pass_count", torch.zeros(B, dtype=torch.uint8, device=self.device))
-            self.flat_union_find_table()
-            
-            # ADD: Simple board history
-             # Shape: (batch_size, max_moves, board_size * board_size)
-            # Stores flattened board state: -1=empty, 0=black, 1=white
-            max_moves = self.board_size * self.board_size * 10
-            self.register_buffer(
+        B, H, W = self.batch_size, self.board_size, self.board_size
+        
+        self.register_buffer("stones", torch.zeros((B, 2, H, W), dtype=torch.bool, device=self.device))
+        self.register_buffer("current_player", torch.zeros(B, dtype=torch.uint8, device=self.device))
+        self.register_buffer("position_hash", torch.zeros(B, dtype=torch.int64, device=self.device))
+        self.register_buffer("ko_points", torch.full((B, 2), -1, dtype=torch.int8, device=self.device))
+        self.register_buffer("pass_count", torch.zeros(B, dtype=torch.uint8, device=self.device))
+        self._init_union_find_table()
+        
+        # Board history with configurable depth using history_factor
+        max_moves = self.board_size * self.board_size * self.history_factor
+        self.register_buffer(
             "board_history", 
             torch.full((B, max_moves, H * W), -1, dtype=torch.int8, device=self.device)
-            )
-            self.register_buffer("move_count", torch.zeros(B, dtype=torch.int32, device=self.device))
+        )
+        self.register_buffer("move_count", torch.zeros(B, dtype=torch.int16, device=self.device))
     
-    def flat_union_find_table(self) -> None:
-        """Initialize flattened union-find table for efficient group tracking"""
+    def _init_union_find_table(self) -> None:
+        """Allocate [colour, parent, liberitry] for every point on the board."""
         B, H, W = self.batch_size, self.board_size, self.board_size
         N_squared = H * W
-    
-        # Create flattened union-find structure
-        # Shape: (batch_size, board_size*board_size, 3)
-        # Column 0: Colour (initialized to -1, for empty)
-        # Column 1: Parent
-        # Column 2: liberty count (initialized to 0)
-        self.register_buffer(
-        "flatten_union_find", 
-        torch.zeros((B, N_squared, 3), dtype=torch.int32, device=self.device)
-    )
-    
-            
-        # Initialize Colour (initialized to -1, for empty)
-        self.flatten_union_find[:, :, 0] = -1
         
-        # Initialize parent indices to point to self
-        indices = torch.arange(N_squared, device=self.device)
-        self.flatten_union_find[:, :, 1] = indices.unsqueeze(0).expand(B, -1)
 
-    
-    # Liberty count starts at 0 (already zero from torch.zeros)
+        self.register_buffer(
+            "flatten_union_table", 
+            torch.zeros((B, N_squared, 4), dtype=torch.int32, device=self.device)
+        )
         
+        
+        # --- column 0 : index --------------------------------------------------
+        idx = torch.arange(N_squared, device=self.device, dtype=torch.int32)         # (N²,)
+        self.flatten_union_table[..., 0] = idx.unsqueeze(0)                  # broadcast to (B, N²)
+
+        # --- column 1 : parent -------------------------------------------------
+        self.flatten_union_table[..., 1] = idx.unsqueeze(0)                                # parent = self
+
+        # --- column 2 : colour -------------------------------------------------
+        self.flatten_union_table[..., 2] = -1                                 # empty
+
+        # --- column 3 : liberitry ---------------------------------------------
+        self.flatten_union_table[..., 3] = 0                                   # 0 liberties
 
     # ==================== CORE UTILITIES ====================
     
-    @timed_method
     def _count_neighbors(self, mask: BoardTensor) -> BoardTensor:
         """Count orthogonal neighbors"""
-        self.call_counts['_count_neighbors'] += 1
-        
-        # Time each sub-operation
-        with TimingContext(self.timings, '_count_neighbors.unsqueeze', self.device):
-            mask_4d = mask.unsqueeze(1).float()
-        
-        with TimingContext(self.timings, '_count_neighbors.conv2d', self.device):
-            counts = F.conv2d(mask_4d, self.neighbor_kernel, padding=1)
-        
-        with TimingContext(self.timings, '_count_neighbors.squeeze', self.device):
-            result = counts.squeeze(1)
-        
+        result = 1
         return result
     
-    @timed_method
-    def _update_hash_for_positions(self, positions: Tuple[Tensor, Tensor, Tensor], colors: Tensor):
-        """Update position hash for stone changes using unified table - OPTIMIZED"""
-        batch_idx, rows, cols = positions
+
+    def switch_player(self) -> None:
+        """Switch current player and update hash for specified games"""
+        self.current_player=self.current_player^1
         
-        # Direct computation using flattened table
-        flat_idx = rows * self.board_size + cols
-        
-        # Use the pre-flattened view for direct indexing
-        hash_values = self.zobrist_stones_flat[colors, flat_idx]
-        
-        # Batch update with XOR
-        self.position_hash[batch_idx] ^= hash_values
-    
-    @with_active_games
-    @timed_method
-    def _toggle_turn(self, active_mask: BatchTensor) -> None:
-        """Switch current player and update hash"""
-        # Update hash for old player
-        self.position_hash[active_mask] ^= self.zobrist_turn[self.current_player[active_mask].long()]
-        # Switch player
-        self.current_player[active_mask] ^= 1
-        # Update hash for new player
-        self.position_hash[active_mask] ^= self.zobrist_turn[self.current_player[active_mask].long()]
-    
+
     def _invalidate_cache(self) -> None:
         """Clear cached values"""
         self._cache.clear()
     
-    
     # ==================== BOARD QUERIES ====================
     
-    @property
-    def empty_mask(self) -> BoardTensor:
-        """Get empty positions (cached)"""
-        if 'empty' not in self._cache:
-            with TimingContext(self.timings, 'empty_mask.compute', self.device):
-                occupied = self.stones.any(dim=1)
-                self._cache['empty'] = ~occupied
-        return self._cache['empty']
     
-    @timed_method
     def get_player_stones(self, player: Optional[int] = None) -> BoardTensor:
         """Get stones for specified player (None = current)"""
         if player is None:
@@ -285,36 +136,92 @@ class TensorBoard(torch.nn.Module):
             return self.stones[batch_idx, self.current_player.long()]
         return self.stones[:, player]
     
-    @timed_method
     def get_opponent_stones(self) -> BoardTensor:
         """Get opponent's stones"""
         batch_idx = get_batch_indices(self.batch_size, self.device)
         opponent = 1 - self.current_player
         return self.stones[batch_idx, opponent.long()]
     
-    def get_playable_games(self, legal_moves: Optional[BoardTensor] = None) -> BatchTensor:
-        """Get mask of games that have at least one legal move."""
-        if legal_moves is None:
-            legal_moves = self.legal_moves()
+    
+    # ==================== Connected Group  ====================
+
+
+
+    # ===  Union–Find helpers  ===============================================
+
+    def _uf_index(self, r: int, c: int) -> int:
+        """Flat index (row × N + col)."""
+        return r * self.board_size + c
+
+
+    def _uf_find(self, batch: int, idx: int) -> int:
+        """Find set representative with path compression."""
+        parent = self.flatten_union_table[batch, idx, 1].item()
+        if parent != idx:
+            root = self._uf_find(batch, parent)
+            self.flatten_union_table[batch, idx, 1] = root  # path-compress
+            return root
+        return parent
+
+
+    def _uf_union(self, batch: int, a_idx: int, b_idx: int) -> None:
+        """Union two groups (very simple: keep the lower index as root)."""
+        root_a = self._uf_find(batch, a_idx)
+        root_b = self._uf_find(batch, b_idx)
         
-        return find_playable_games(legal_moves)
+            # ---- combine liberty counters ----------------------------------------
+        lib_a = self.flatten_union_table[batch, root_a, 2].item()
+        lib_b = self.flatten_union_table[batch, root_b, 2].item()
+        merged_lib = lib_a + lib_b          # no overlap because stones touch orthogonally
+        if root_a == root_b:
+            return
+        # Choose root deterministically; rank field (col 2) is kept for later.
+        if root_a < root_b:
+            self.flatten_union_table[batch, root_b, 1] = root_a
+        else:
+            self.flatten_union_table[batch, root_a, 1] = root_b
+
+
+    # ------------ 3. adding a stone -------------------------------------------
+    def _union_find_add_stone(self, batch: int, r: int, c: int, colour: int) -> None:
+        """
+        Put the new stone into the UF table, compute its initial liberties,
+        then union with orthogonal neighbours of the same colour.
+        """
+        flat = self._uf_index(r, c)
+
+        # --- 3.1 initial entry -------------------------------------------------
+        self.flatten_union_table[batch, flat, 0] = colour
+        self.flatten_union_table[batch, flat, 1] = flat
+
+        # 3.2 count empty orthogonal neighbours for first liberty value
+        empty_lib = 0
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < self.board_size and 0 <= nc < self.board_size:
+                # if target point is empty, increment liberty counter
+                if not self.stones[batch, :, nr, nc].any():
+                    empty_lib += 1
+        self.flatten_union_table[batch, flat, 2] = empty_lib
+
+        # 3.3 merge with same-coloured neighbours --------------------------
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < self.board_size and 0 <= nc < self.board_size:
+                n_idx = self._uf_index(nr, nc)
+                if self.flatten_union_table[batch, n_idx, 0].item() == colour:
+                    self._uf_union(batch, flat, n_idx)
+
+
     
-    
-    def get_current_flat_union_table(self) -> Tensor:
-         """Get current flattened union-find table without updating"""
-         return self.flatten_union_find.clone()
-         
-         
     # ==================== KO HANDLING ====================
     
-    @timed_method
     def _apply_ko_restrictions(self, legal: BoardTensor) -> BoardTensor:
         """Apply ko restrictions to legal moves"""
         has_ko = self.ko_points[:, 0] >= 0
         if not has_ko.any():
             return legal
         
-        # Remove ko points from legal moves
         ko_games = has_ko.nonzero(as_tuple=True)[0]
         ko_rows = self.ko_points[ko_games, 0].long()
         ko_cols = self.ko_points[ko_games, 1].long()
@@ -323,276 +230,121 @@ class TensorBoard(torch.nn.Module):
         legal[ko_games, ko_rows, ko_cols] = False
         return legal
     
-    @timed_method
     def _detect_ko(self, captured_positions: Tuple[Tensor, Tensor, Tensor]) -> None:
-        """Detect and set ko points for single stone captures - OPTIMIZED"""
+        """Detect and set ko points for single stone captures"""
         batch_idx, rows, cols = captured_positions
-        
-
         
         # Reset ko points
         self.ko_points.fill_(-1)
         
-        # Set all potential ko points (last write wins naturally)
-        # No need for .to(torch.int8) since ko_points is already int8
+        # Set all potential ko points
         self.ko_points[batch_idx, 0] = rows.to(torch.int8)
         self.ko_points[batch_idx, 1] = cols.to(torch.int8)
-    
+        
         # Count captures using scatter_add
         capture_counts = torch.zeros(self.batch_size, dtype=torch.int8, device=self.device)
         capture_counts.scatter_add_(0, batch_idx, torch.ones_like(batch_idx, dtype=torch.int8))
-    
+        
         # Clear ko for games with != 1 capture
         invalid_ko_mask = (capture_counts != 1)
         self.ko_points[invalid_ko_mask] = -1
-        
-        
-
     
     # ==================== LEGAL MOVES ====================
     
-    @timed_method
-    def legal_moves(self) -> BoardTensor:
-        """Compute legal moves for current player"""
-        self.call_counts['legal_moves'] += 1
+    def legal_moves(self,) -> BoardTensor:
+
         
-        if 'legal' in self._cache:
-            return self._cache['legal']
-        
-        # Get active (non-finished) games
-        with TimingContext(self.timings, 'legal_moves.active_games', self.device):
-            active_games = ~self.is_game_over()
-        
-        # No moves if all games are over
-        if not active_games.any():
-            legal = torch.zeros((self.batch_size, self.board_size, self.board_size), 
-                              dtype=torch.bool, device=self.device)
-            self._cache['legal'] = legal
-            return legal
-        
-        # Start with empty positions that have liberties
-        with TimingContext(self.timings, 'legal_moves.basic_legal', self.device):
-            legal = self.empty_mask & (self._count_neighbors(self.empty_mask) > 0)
-        
-        # Add capture moves
-        with TimingContext(self.timings, 'legal_moves.capture_moves', self.device):
-            legal |= self._find_capture_moves()
+        # Start with empty positions where no stones are placed
+        legal = ~self.stones.any(dim=1)
         
         # Apply ko restrictions
-        with TimingContext(self.timings, 'legal_moves.ko_restrictions', self.device):
-            legal = self._apply_ko_restrictions(legal)
-        
-        # Mask finished games
-        legal[~active_games] = False
-        
-        self._cache['legal'] = legal
+        legal = self._apply_ko_restrictions(legal)
+         
         return legal
     
-    @timed_method
-    def _find_capture_moves(self) -> BoardTensor:
-        """Find moves that would capture opponent stones"""
-        opponent = self.get_opponent_stones()
-        
-        # Find opponent stones with exactly 1 liberty
-        liberties = self._count_neighbors(self.empty_mask) * opponent
-        vulnerable = opponent & (liberties == 1)
-        
-        # Find empty points adjacent to vulnerable stones
-        return self.empty_mask & (self._count_neighbors(vulnerable) > 0)
-    
-    # ==================== MOVE EXECUTION ====================
 
-    # Add simple update method:
-    def _update_board_history(self, active_mask: BatchTensor) -> None:
-        """Update board history for active games"""
-        if not active_mask.any():
-            return
     
-        active_idx = active_mask.nonzero(as_tuple=True)[0]
-        move_idx = self.move_count[active_idx].long()
     
-        # Convert current board state to history format
-        # black=0, white=1, empty=-1
-        black_flat = self.stones[active_idx, 0].flatten(1, 2)  # (active_games, H*W)
-        white_flat = self.stones[active_idx, 1].flatten(1, 2)
+     # ==================== MOVE EXECUTION ====================
     
-        board_state = torch.full_like(black_flat, -1, dtype=torch.int8)
-        board_state[black_flat] = 0
-        board_state[white_flat] = 1
     
-        self.board_history[active_idx, move_idx] = board_state
-        
-    @timed_method
-    def step(self, positions: PositionTensor) -> None:
-
-        # update board history
-        active = ~self.is_game_over()
-        self._update_board_history(active)
-      
-        # Increment move count
-        self.move_count[active] += 1
-        
-        
-        
-        
-        """Main logic to Execute moves for all games"""
-        self._invalidate_cache()
-        
-        # Classify moves
-        with TimingContext(self.timings, 'step.classify_moves', self.device):
-            is_pass = is_pass_move(positions)
-            finished = self.is_game_over()
-            is_play = ~is_pass & ~finished
-        
-        # Update pass counter
-        with TimingContext(self.timings, 'step.update_pass', self.device):
-            self.pass_count = torch.where(
-                is_pass | finished,
-                torch.where(is_pass, self.pass_count + 1, self.pass_count),
-                torch.zeros_like(self.pass_count)
-            )
-        
-        # Reset ko
-        with TimingContext(self.timings, 'step.reset_ko', self.device):
-            if not finished.all():
-                self.ko_points[~finished] = -1
-        
-        # Execute moves
-        with TimingContext(self.timings, 'step.place_stones_check', self.device):
-            if is_play.any():
-                self._place_stones(positions[is_play], is_play.nonzero(as_tuple=True)[0])
-        
-        # Switch turn
-        self._toggle_turn()
     
-    @timed_method
-    def _place_stones(self, positions: PositionTensor, batch_idx: Tensor) -> None:
-        """Place stones and handle captures"""
-        rows, cols = positions[:, 0].long(), positions[:, 1].long()
-        colors = self.current_player[batch_idx].long()
-        
-        # Place stones
-        with TimingContext(self.timings, '_place_stones.set_stones', self.device):
-            self.stones[batch_idx, colors, rows, cols] = True
-        
-        # Update hash
-        self._update_hash_for_positions((batch_idx, rows, cols), colors)
-        
-        # Handle captures
-        self._process_captures(batch_idx, rows, cols)
-        
     
-    @timed_method
-    def _process_captures(self, batch_idx: Tensor, rows: Tensor, cols: Tensor) -> None:
+    def _place_stones(self, positions: PositionTensor) -> None:
+        """Place stones and handle captures - WITH SUICIDE PREVENTION"""
+       
         
+        
+        
+    def _process_captures(self, batch_idx: Tensor, rows: Tensor, cols: Tensor) -> Tensor:
         """Remove captured opponent groups"""
-        self.call_counts['_process_captures'] += 1
         
-        # Find adjacent opponent stones
-        with TimingContext(self.timings, '_process_captures.setup', self.device):
-            move_mask = torch.zeros((self.batch_size, self.board_size, self.board_size), 
-                                   dtype=torch.float32, device=self.device)
-            move_mask[batch_idx, rows, cols] = 1.0
+        captured_any = torch.zeros(len(batch_idx), dtype=torch.bool, device=self.device)
         
-        with TimingContext(self.timings, '_process_captures.find_neighbors', self.device):
-            neighbors = self._count_neighbors(move_mask) > 0
-            opponent_stones = self.get_opponent_stones()
-            seeds = neighbors & opponent_stones
-        
-        if not seeds.any():
-            return
-        
-        # Flood fill to find complete groups
-        with TimingContext(self.timings, '_process_captures.flood_fill', self.device):
+      
             
-            groups = self._flood_fill(seeds, opponent_stones)
-        
-        # Find captured groups
-        with TimingContext(self.timings, '_process_captures.find_captured', self.device):
-            # Find all positions adjacent to ANY stone in each group
-            captured = torch.zeros_like(opponent_stones)
-            
-            # For each batch
-            for b in range(self.batch_size):
-                if not seeds[b].any():
-                    continue
-                
-                # Find all seed positions (opponent stones adjacent to our move)
-                seed_positions = seeds[b].nonzero(as_tuple=False)
-                already_processed = torch.zeros_like(seeds[b], dtype=torch.bool)
-                
-                # Check each seed position - it might belong to a different group!
-                for seed_idx in range(len(seed_positions)):
-                    seed_r = seed_positions[seed_idx, 0]
-                    seed_c = seed_positions[seed_idx, 1]
-                    
-                    # Skip if this stone was already processed as part of another group
-                    if already_processed[seed_r, seed_c]:
-                        continue
-                    
-                    
-                    # Find the complete group starting from this single seed
-                    single_seed = torch.zeros_like(seeds[b])
-                    single_seed[seed_r, seed_c] = True
-                    
-                    
-                    # Flood fill from just this one seed
-                    current_group = self._flood_fill(
-                        single_seed.unsqueeze(0), 
-                        opponent_stones[b].unsqueeze(0)
-                    ).squeeze(0)
-                    
-                     # Mark all stones in this group as processed
-                    already_processed |= current_group
-                    
-                    # Check if THIS SPECIFIC group has liberties
-                    group_adjacent = self._count_neighbors(current_group.unsqueeze(0).float()).squeeze(0) > 0
-                    group_has_liberties = (group_adjacent & self.empty_mask[b]).any()
-                    
-                    # If no liberties, capture this group
-                    if not group_has_liberties:
-                        captured[b] |= current_group
-                
-        
-        if captured.any():
-            self._remove_captured_stones(captured)
+        return captured_any
     
-    @timed_method
+    
+    
+    
+        
+    
+    
     def _flood_fill(self, seeds: BoardTensor, mask: BoardTensor) -> BoardTensor:
         """Expand seeds to complete groups"""
-        self.call_counts['_flood_fill'] += 1
         groups = seeds.clone()
-        iterations = 0
-        
-        while True:
-            with TimingContext(self.timings, f'_flood_fill.iter', self.device):
-                expanded = (self._count_neighbors(groups) > 0) & mask & ~groups
-                if not expanded.any():
-                    break
-                groups |= expanded
-                iterations += 1
-        
-        # Store iteration count separately (not as timing)
-        self.flood_fill_iterations.append(iterations)
-        return groups
+
     
-    @timed_method
-    def _remove_captured_stones(self, captured: BoardTensor) -> None:
-        """Remove captured stones and handle ko"""
-        positions = captured.nonzero(as_tuple=False)
-        batch_idx = positions[:, 0]
-        rows = positions[:, 1]
-        cols = positions[:, 2]
         
-        # Determine colors and remove stones
-        colors = (1 - self.current_player[batch_idx]).long()
-        self.stones[batch_idx, colors, rows, cols] = False
+    
+    # ==================== each single STEP ====================
+    
+
+    
+    def step(self) -> None:
+        """Execute moves for all games - optimized with single active check"""
         
-        # Update hash
-        self._update_hash_for_positions((batch_idx, rows, cols), colors)
+ 
+        player_stones = self.get_player_stones()
+        opponent_stones = self.get_opponent_stones()
+
         
-        # Detect ko
-        self._detect_ko((batch_idx, rows, cols))
+        # Update board history and move count
+        self._update_board_history_indexed()
+        self.move_count+= 1
+        
+        # Classify moves (only for active games)
+        is_pass = is_pass_move()
+        is_play = ~is_pass
+        
+
+        
+        # Pass-counter update (branch-free)
+        self.pass_count = torch.where(
+        is_pass,
+        self.pass_count + 1,                   # increment where pass
+        torch.zeros_like(self.pass_count)      # reset where play
+        )
+        
+        # Reset ko for active games
+        self.ko_points.fill(-1)
+        
+
+        self._place_stones(PositionTensor)
+        
+        
+        # Switch turn only for active games
+        self.switch_player()
+    
+    
+    
+   
+    
+    
+    
+    
+
     
     # ==================== GAME STATE ====================
     
@@ -602,18 +354,70 @@ class TensorBoard(torch.nn.Module):
     
     def compute_scores(self) -> Tensor:
         """Compute current scores"""
-        black = self.stones[:, Stone.BLACK].sum(dim=(1, 2)).float()
-        white = self.stones[:, Stone.WHITE].sum(dim=(1, 2)).float()
+        black = self.stones[:, Stone.BLACK].sum(dim=(1, 2))
+        white = self.stones[:, Stone.WHITE].sum(dim=(1, 2))
         return torch.stack([black, white], dim=1)
+    
+    
+    
+    
+    
     
     # ==================== TIMING REPORTS ====================
     
+    def print_cuurent_union_find_table(self,) -> Tensor:
+        """Get current flattened union-find table - with debug visualization"""
     
-    # Add this single method to your TensorBoard class (at the end):
 
+        # For batch 0, let's visualize what's in the table
+        batch_idx = 0
+        board_size = self.board_size
+        
+        print(f"\n=== Union-Find Table for Batch {batch_idx} ===")
+        print(f"Board size: {board_size}×{board_size}")
+        print(f"Table shape: {self.flatten_union_table.shape}")
+        
+        # Show the structure for first few positions
+        print("\nTable structure: [color, parent, rank]")
+        print("Flat idx | (r,c) | Color | Parent | Rank")
+        print("-" * 45)
+        
+        for flat_idx in range(board_size * board_size):
+            row = flat_idx // board_size
+            col = flat_idx % board_size
+            
+            color = self.flatten_union_table[batch_idx, flat_idx, 0].item()
+            parent = self.flatten_union_table[batch_idx, flat_idx, 1].item()
+            rank = self.flatten_union_table[batch_idx, flat_idx, 2].item()
+            
+            
+            print(f"{flat_idx:8d} | ({row},{col}) | {color:3d} | {parent:6d} | {rank:4d}")
+ 
+    
     def print_timing_report(self, top_n: int = 30) -> None:
         """Wrapper to call shared timing report."""
         if self.enable_timing:
             from utils.shared import print_timing_report
-        print_timing_report(self, top_n)
+            print_timing_report(self, top_n)
+            
+            
+   # ==================== History Record====================
    
+    def _update_board_history_indexed(self, game_indices: Tensor) -> None:
+        """Update board history for specified games"""
+        if game_indices.numel() == 0:
+            return
+        
+        move_idx = self.move_count[game_indices].long()
+        
+        # Get board state for specified games
+        black_flat = self.stones[game_indices, 0].flatten(1, 2)
+        white_flat = self.stones[game_indices, 1].flatten(1, 2)
+        
+        board_state = torch.full_like(black_flat, -1, dtype=torch.int8)
+        board_state[black_flat] = 0
+        board_state[white_flat] = 1
+        
+        # Advanced indexing to update history
+        batch_range = torch.arange(len(game_indices), device=self.device)
+        self.board_history[game_indices[batch_range], move_idx[batch_range]] = board_state
