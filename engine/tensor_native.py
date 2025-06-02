@@ -1,5 +1,5 @@
-# tensor_native.py – Optimised Go engine with GoLegalMoveChecker integration
-# (fully int-aligned, no stray .item() calls left)
+# tensor_native.py – optimised Go engine with GoLegalMoveChecker integration
+# fully int‑aligned, hot‑path free of .item() / .tolist(), and 100 % batched capture/ko bookkeeping.
 
 from __future__ import annotations
 import os
@@ -8,40 +8,37 @@ from dataclasses import dataclass
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
-# -----------------------------------------------------------------------------#
-#  Shared utilities                                                            #
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Shared utilities
+# -----------------------------------------------------------------------------
 from utils.shared import (
     select_device,
-    is_pass_move,
     get_batch_indices,
     timed_method,
     print_timing_report,
 )
 
-# -----------------------------------------------------------------------------#
-#  GoLegalMoveChecker import (robust to package layout)                        #
-# -----------------------------------------------------------------------------#
-try:                     # 1. relative
+# -----------------------------------------------------------------------------
+# GoLegalMoveChecker import
+# -----------------------------------------------------------------------------
+try:
     from . import GoLegalMoveChecker as legal_module
 except (ImportError, AttributeError):
-    try:                 # 2. top-level
+    try:
         import GoLegalMoveChecker as legal_module
-    except (ImportError, AttributeError):  # 3. engine sub-package
+    except (ImportError, AttributeError):
         from engine import GoLegalMoveChecker as legal_module
-
 GoLegalMoveChecker = legal_module.GoLegalMoveChecker
 
-# -----------------------------------------------------------------------------#
-#  Environment setup                                                           #
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Environment
+# -----------------------------------------------------------------------------
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
-# ========================= CONSTANTS ========================================= #
+# ========================= CONSTANTS =========================================
 
 @dataclass(frozen=True)
 class Stone:
@@ -55,10 +52,11 @@ StoneTensor    = Tensor   # (B, 2, H, W)
 PositionTensor = Tensor   # (B, 2)
 BatchTensor    = Tensor   # (B,)
 
-# ========================= GO ENGINE ========================================= #
+# ========================= GO ENGINE =========================================
 
 class TensorBoard(torch.nn.Module):
-    """Elegant vectorised Go board with batched legal-move checking."""
+    """Vectorised multi‑game Go board with batched legal‑move checking."""
+
     # ------------------------------------------------------------------ #
     # Construction                                                       #
     # ------------------------------------------------------------------ #
@@ -71,25 +69,26 @@ class TensorBoard(torch.nn.Module):
         enable_timing: bool = True,
     ) -> None:
         super().__init__()
-        self.batch_size      = batch_size
-        self.board_size      = board_size
-        self.history_factor  = history_factor
-        self.device          = device or select_device()
-        self.enable_timing   = enable_timing
+        self.batch_size     = batch_size
+        self.board_size     = board_size
+        self.history_factor = history_factor
+        self.device         = device or select_device()
+        self.enable_timing  = enable_timing
 
-        # Timing helpers
-        object.__setattr__(self, "timings",      defaultdict(list) if enable_timing else {})
-        object.__setattr__(self, "call_counts",  defaultdict(int)  if enable_timing else {})
+        object.__setattr__(self, "timings",
+                           defaultdict(list) if enable_timing else {})
+        object.__setattr__(self, "call_counts",
+                           defaultdict(int)  if enable_timing else {})
 
         # Core helper
-        self.legal_checker = GoLegalMoveChecker(board_size=board_size, device=self.device)
+        self.legal_checker = GoLegalMoveChecker(board_size=board_size,
+                                                device=self.device)
 
         self._init_zobrist_table()
         self._init_constants()
         self._init_state()
-        self._cache = {}
 
-        # Cached legal/capture info (invalidated every move)
+        self._cache = {}
         self._last_legal_mask   = None
         self._last_capture_info = None
 
@@ -97,16 +96,14 @@ class TensorBoard(torch.nn.Module):
     # Static data                                                        #
     # ------------------------------------------------------------------ #
     def _init_zobrist_table(self) -> None:
-        """Stub – fill in if you need Zobrist hashing."""
-        pass
+        pass  # left as stub
 
     def _init_constants(self) -> None:
-        """Neighbour offsets as *plain ints* (N, S, W, E)."""
         self.NEIGHBOR_OFFSETS = (
-            -self.board_size,   # North
-             self.board_size,   # South
-            -1,                 # West
-             1,                 # East
+            -self.board_size,   # N
+             self.board_size,   # S
+            -1,                 # W
+             1,                 # E
         )
 
     # ------------------------------------------------------------------ #
@@ -114,20 +111,26 @@ class TensorBoard(torch.nn.Module):
     # ------------------------------------------------------------------ #
     def _init_state(self) -> None:
         B, H, W = self.batch_size, self.board_size, self.board_size
+        dev     = self.device
 
-        self.register_buffer("stones",         torch.zeros((B, 2, H, W), dtype=torch.bool,  device=self.device))
-        self.register_buffer("current_player", torch.zeros(B,               dtype=torch.uint8, device=self.device))
-        self.register_buffer("position_hash",  torch.zeros(B,               dtype=torch.int64, device=self.device))
-        self.register_buffer("ko_points",      torch.full((B, 2), -1,       dtype=torch.int8,  device=self.device))
-        self.register_buffer("pass_count",     torch.zeros(B,               dtype=torch.uint8, device=self.device))
+        self.register_buffer("stones",
+                             torch.zeros((B, 2, H, W), dtype=torch.bool,
+                                         device=dev))
+        self.register_buffer("current_player",
+                             torch.zeros(B, dtype=torch.uint8, device=dev))
+        self.register_buffer("ko_points",
+                             torch.full((B, 2), -1, dtype=torch.int8,
+                                        device=dev))
+        self.register_buffer("pass_count",
+                             torch.zeros(B, dtype=torch.uint8, device=dev))
 
-        # Board history: depth = board_size² × history_factor
         max_moves = self.board_size * self.board_size * self.history_factor
         self.register_buffer(
             "board_history",
-            torch.full((B, max_moves, H * W), -1, dtype=torch.int8, device=self.device),
+            torch.full((B, max_moves, H * W), -1, dtype=torch.int8, device=dev)
         )
-        self.register_buffer("move_count", torch.zeros(B, dtype=torch.int16, device=self.device))
+        self.register_buffer("move_count",
+                             torch.zeros(B, dtype=torch.int16, device=dev))
 
     # ==================== CORE UTILITIES ==================================== #
     def switch_player(self) -> None:
@@ -139,18 +142,7 @@ class TensorBoard(torch.nn.Module):
         self._last_legal_mask   = None
         self._last_capture_info = None
 
-    # ==================== BOARD QUERIES ===================================== #
-    def get_player_stones(self, player: Optional[int] = None) -> BoardTensor:
-        if player is None:
-            idx = get_batch_indices(self.batch_size, self.device)
-            return self.stones[idx, self.current_player.long()]
-        return self.stones[:, player]
-
-    def get_opponent_stones(self) -> BoardTensor:
-        idx = get_batch_indices(self.batch_size, self.device)
-        return self.stones[idx, (1 - self.current_player).long()]
-
-    # ==================== CAPTURE REMOVAL =================================== #
+    # ==================== CAPTURE / KO HELPERS ============================== #
     def _remove_captured_stones_by_root(
         self,
         batch_idx: int,
@@ -159,119 +151,140 @@ class TensorBoard(torch.nn.Module):
         colour: torch.Tensor,
         opponent: int,
     ) -> int:
-        """Remove every stone belonging to a captured group; return count."""
-        mask           = (roots[batch_idx] == root_idx) & (colour[batch_idx] == opponent)
-        captured_count = int(mask.sum())
-        if captured_count:
-            pos     = mask.nonzero(as_tuple=True)[0]          # flat indices
-            rows    = pos // self.board_size
-            cols    = pos %  self.board_size
+        mask = (roots[batch_idx] == root_idx) & (colour[batch_idx] == opponent)
+        ncap = int(mask.sum())
+        if ncap:
+            pos  = mask.nonzero(as_tuple=True)[0]
+            rows = pos // self.board_size
+            cols = pos %  self.board_size
             self.stones[batch_idx, opponent, rows, cols] = False
-        return captured_count
+        return ncap
 
-    # ==================== KO HANDLING ======================================= #
-    def _detect_ko(
-        self,
-        batch_idx: int,
-        row: int,
-        col: int,
-        captured_count: int,
-        capture_positions: List[Tuple[int, int]],
-    ) -> None:
-        if captured_count == 1 and len(capture_positions) == 1:
-            r, c = capture_positions[0]
-            self.ko_points[batch_idx] = torch.tensor([r, c], dtype=torch.int8, device=self.device)
-        else:
-            self.ko_points[batch_idx] = -1
-
-    # ==================== LEGAL MOVES ======================================= #
+    # ------------------------------------------------------------------ #
+    # Legal moves and capture info wrappers                              #
+    # ------------------------------------------------------------------ #
     @timed_method
     def legal_moves(self) -> BoardTensor:
-        legal_mask, capture_info = self.legal_checker.compute_legal_moves_with_captures(
+        legal_mask, cap_info = self.legal_checker.compute_legal_moves_with_captures(
             stones=self.stones,
             current_player=self.current_player,
             ko_points=self.ko_points,
             return_capture_info=True,
         )
         self._last_legal_mask   = legal_mask
-        self._last_capture_info = capture_info
+        self._last_capture_info = cap_info
         return legal_mask
 
-    @timed_method
-    def get_capture_info(self, b: int, r: int, c: int) -> Dict:
-        if self._last_capture_info is None:
-            self.legal_moves()
-        info = self._last_capture_info
-        return dict(
-            would_capture = info["would_capture"][b, r, c],
-            capture_groups= info["capture_groups"][b, r, c],
-            capture_sizes = info["capture_sizes"][b, r, c],
-            total_captures= info["total_captures"][b, r, c],
-        )
-
     # ==================== MOVE EXECUTION ==================================== #
+
+    @timed_method
     def _place_stones(self, positions: PositionTensor) -> None:
-        B = positions.size(0)
-        for i in range(B):
-            row, col = map(int, positions[i].tolist())
+        """Vectorised stone placement **and** capture / ko bookkeeping."""
+        H = W = self.board_size
 
-            # Pass move?
-            if row < 0 or col < 0:
-                continue
-            if row >= self.board_size or col >= self.board_size:
-                print(f"Warning: move {(row, col)} out of bounds");  continue
+        # ------------------------------------------------------------------ #
+        # 1) Vectorised stone placement                                     #
+        # ------------------------------------------------------------------ #
+        mask_play = (positions[:, 0] >= 0) & (positions[:, 1] >= 0)
+        if mask_play.any():
+            b_idx = mask_play.nonzero(as_tuple=True)[0]
+            rows  = positions[b_idx, 0].long()
+            cols  = positions[b_idx, 1].long()
+            ply   = self.current_player[b_idx].long()
+            self.stones[b_idx, ply, rows, cols] = True
+        else:
+            b_idx = None  # no real moves this turn
 
-            player, opponent = int(self.current_player[i]), 1 - int(self.current_player[i])
-            self.stones[i, player, row, col] = True
+        # Early‑out if no capture info yet or nothing was played
+        if self._last_capture_info is None or b_idx is None:
+            return
 
-            total_captured   = 0
-            capture_positions: list[tuple[int, int]] = []
+        # ------------------------------------------------------------------ #
+        # 2) Build capture mask in pure tensor code                         #
+        # ------------------------------------------------------------------ #
+        roots      = self._last_capture_info["roots"]      # (B, N²)
+        colour     = self._last_capture_info["colour"]     # (B, N²)
+        cap_groups = self._last_capture_info["capture_groups"]  # (B,H,W,4)
+        cap_sizes  = self._last_capture_info["capture_sizes"]   # (B,H,W,4)
+        total_caps = self._last_capture_info["total_captures"]  # (B,H,W)
 
-            if self._last_capture_info is not None:
-                info    = self.get_capture_info(i, row, col)
-                if info["would_capture"]:
-                    roots   = self._last_capture_info["roots"]
-                    colour  = self._last_capture_info["colour"]
-                    seen_roots: set[int] = set()
+        rows  = positions[b_idx, 0].long()
+        cols  = positions[b_idx, 1].long()
+        flat  = rows * W + cols
+        opp   = (1 - self.current_player[b_idx]).long()
 
-                    for dir_idx in range(4):
-                        root = int(info["capture_groups"][dir_idx])
-                        if root >= 0 and root not in seen_roots:
-                            seen_roots.add(root)
-                            captured = self._remove_captured_stones_by_root(
-                                i, root, roots, colour, opponent
-                            )
-                            if captured:
-                                total_captured += captured
-                                flat     = row * self.board_size + col
-                                nbr_flat = flat + self.NEIGHBOR_OFFSETS[dir_idx]
-                                nbr_row  = nbr_flat // self.board_size
-                                nbr_col  = nbr_flat %  self.board_size
-                                capture_positions.append((nbr_row, nbr_col))
+        neigh_roots = cap_groups[b_idx, rows, cols]            # (M,4)
+        valid_root  = neigh_roots >= 0
 
-            if total_captured:
-                self._detect_ko(i, row, col, total_captured, capture_positions)
+        roots_sel  = roots[b_idx]                               # (M,N²)
+        colour_sel = colour[b_idx]
+
+        eq_root = (roots_sel.unsqueeze(2) == neigh_roots.unsqueeze(1)) & valid_root.unsqueeze(1)
+        cap_mask_flat = eq_root.any(dim=2) & (colour_sel == opp.unsqueeze(1))
+        cap_mask = cap_mask_flat.view(-1, H, W)                 # (M,H,W)
+
+        # ------------------------------------------------------------------ #
+        # 3) Clear captured stones & update ko                            #
+        # ------------------------------------------------------------------ #
+        self.stones[b_idx, opp] &= ~cap_mask
+
+        single_cap = (total_caps[b_idx, rows, cols] == 1)
+        if single_cap.any():
+            sizes_here = cap_sizes[b_idx, rows, cols]
+            dir_single = (sizes_here == 1).float().argmax(dim=1)
+            nbr_flat   = flat + torch.tensor(self.NEIGHBOR_OFFSETS, device=self.device)[dir_single]
+            r_ko = nbr_flat // W          # row index of the ko-point
+            c_ko = nbr_flat %  W          # column index
+
+            self.ko_points[b_idx[single_cap]] = (
+            torch.stack([r_ko, c_ko], dim=1)
+            .to(self.ko_points.dtype)          #  ← added cast to int8
+            )[single_cap]
+
+
+        # clear ko on boards that didn't make a single‑stone capture
+        self.ko_points[b_idx[~single_cap]] = -1
+
+
 
     # ------------------------------------------------------------------ #
     # History                                                            #
     # ------------------------------------------------------------------ #
     @timed_method
+        # ------------------------------------------------------------------ #
+    # History                                                            #
+    # ------------------------------------------------------------------ #
+    @timed_method
     def _update_board_history(self) -> None:
-        black = self.stones[:, 0].flatten(1)
-        white = self.stones[:, 1].flatten(1)
-        board_state = torch.where(
-            black,
-            torch.zeros_like(black, dtype=torch.int8),
-            torch.where(
-                white,
-                torch.ones_like(white, dtype=torch.int8),
-                torch.full_like(white, -1, dtype=torch.int8),
-            ),
-        )
-        move_idx = self.move_count.long()
-        for b in range(self.batch_size):
-            if move_idx[b] < self.board_history.shape[1]:
-                self.board_history[b, move_idx[b]] = board_state[b]
+        """
+        Record the current position for every live game in the batch.
+
+        board_history  : (B, max_moves, H*W)  int8   – -1 empty, 0 black, 1 white
+        move_count[b]  : how many moves have already been written for board b
+        """
+        B, H, W = self.batch_size, self.board_size, self.board_size
+        max_moves = self.board_history.shape[1]
+
+        # ------------------------------------------------------------------
+        # 1) Flatten current stones into a single int8 board_state
+        # ------------------------------------------------------------------
+        black = self.stones[:, 0].flatten(1)            # [B, H*W] – bool
+        white = self.stones[:, 1].flatten(1)            # [B, H*W] – bool
+
+        board_state = torch.full_like(black, -1, dtype=torch.int8)   # start as empty
+        board_state[black]                   = 0                    # black stones
+        board_state[(~black) & white]        = 1                    # white stones
+
+        # ------------------------------------------------------------------
+        # 2) Batch-wise write into history (no Python loop)
+        # ------------------------------------------------------------------
+        move_idx = self.move_count.long()                             # [B]
+        valid    = move_idx < max_moves                               # boards not past limit
+        if valid.any():
+            b_idx   = torch.arange(B, device=self.device)[valid]      # [M]
+            mv_idx  = move_idx[valid]                                 # [M]
+            self.board_history[b_idx, mv_idx] = board_state[b_idx]    # vectorised write
+
 
     # ------------------------------------------------------------------ #
     # Game loop                                                          #
@@ -287,7 +300,11 @@ class TensorBoard(torch.nn.Module):
         self.move_count += 1
 
         is_pass = (positions[:, 0] < 0) | (positions[:, 1] < 0)
-        self.pass_count = torch.where(is_pass, self.pass_count + 1, torch.zeros_like(self.pass_count))
+        self.pass_count = torch.where(
+            is_pass,
+            self.pass_count + 1,
+            torch.zeros_like(self.pass_count),
+        )
         self.ko_points[~is_pass] = -1  # clear ko before play moves
 
         self._place_stones(positions)
