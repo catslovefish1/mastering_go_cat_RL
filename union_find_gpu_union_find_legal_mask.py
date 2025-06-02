@@ -273,7 +273,7 @@ def demo_initialized_board():
 
     # Initialize board with black and white stones
     black_stones = [(0, 1), (1, 0), (1, 2), (1, 3), (2, 1)]
-    white_stones = [(2,0),(0, 2), (2, 2), (3, 1)]  # Add some white stones
+    white_stones = [(0, 2), (2, 2), (3, 1)]  # Add some white stones
     
     print("Placing black stones at:", black_stones)
     for rc in black_stones:

@@ -80,12 +80,12 @@ def simulate_batch_games(
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=64,
-        board_size=4,
-        history_factor=10,
-        log_interval=1,
+        num_games=512,
+        board_size=5,
+        history_factor=4,
+        log_interval=16,
         show_boards=2,
-        enable_timing=False,
+        enable_timing=True,
         save_history=True,
         num_games_to_save=5
     )

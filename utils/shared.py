@@ -251,6 +251,10 @@ def timed_method(method: Callable) -> Callable:
         
         # Use TimingContext if the object has the required attributes
         if hasattr(self, 'timings') and hasattr(self, 'device'):
+            # Increment call count if available
+            if hasattr(self, 'call_counts'):
+                self.call_counts[method.__name__] += 1
+            
             with TimingContext(self.timings, method.__name__, self.device, getattr(self, 'enable_timing', True)):
                 return method(self, *args, **kwargs)
         else:
@@ -376,14 +380,7 @@ def print_timing_report(board, top_n: int = 30) -> None:
     for func_name, count in sorted(board.call_counts.items(), key=lambda x: x[1], reverse=True):
         print(f"{func_name:<40} {count:<10}")
     
-    # Special statistics for flood fill iterations
-    if board.flood_fill_iterations:
-        print(f"\n\nFlood Fill Statistics:")
-        print(f"  Total flood fills: {len(board.flood_fill_iterations)}")
-        print(f"  Average iterations: {sum(board.flood_fill_iterations)/len(board.flood_fill_iterations):.2f}")
-        print(f"  Max iterations: {max(board.flood_fill_iterations)}")
-        print(f"  Min iterations: {min(board.flood_fill_iterations)}")
-        print(f"  Total iterations: {sum(board.flood_fill_iterations)}")
+ 
 
 def print_performance_metrics(elapsed: float, moves_made: int, num_games: int) -> None:
     """Print performance metrics for a simulation run."""
