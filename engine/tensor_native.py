@@ -15,7 +15,6 @@ from torch import Tensor
 # -----------------------------------------------------------------------------
 from utils.shared import (
     select_device,
-    get_batch_indices,
     timed_method,
     print_timing_report,
 )
@@ -23,13 +22,8 @@ from utils.shared import (
 # -----------------------------------------------------------------------------
 # GoLegalMoveChecker import
 # -----------------------------------------------------------------------------
-try:
-    from . import GoLegalMoveChecker as legal_module
-except (ImportError, AttributeError):
-    try:
-        import GoLegalMoveChecker as legal_module
-    except (ImportError, AttributeError):
-        from engine import GoLegalMoveChecker as legal_module
+
+from engine import GoLegalMoveChecker as legal_module
 GoLegalMoveChecker = legal_module.GoLegalMoveChecker
 
 # -----------------------------------------------------------------------------
@@ -48,9 +42,8 @@ class Stone:
 
 
 BoardTensor    = Tensor   # (B, H, W)
-StoneTensor    = Tensor   # (B, 2, H, W)
 PositionTensor = Tensor   # (B, 2)
-BatchTensor    = Tensor   # (B,)
+PassTensor    = Tensor   # (B,)
 
 # ========================= GO ENGINE =========================================
 
@@ -113,9 +106,9 @@ class TensorBoard(torch.nn.Module):
         B, H, W = self.batch_size, self.board_size, self.board_size
         dev     = self.device
 
-        self.register_buffer("stones",
-                             torch.zeros((B, 2, H, W), dtype=torch.bool,
-                                         device=dev))
+        self.register_buffer("board",
+                     torch.full((B, H, W), Stone.EMPTY,
+                                dtype=torch.int8, device=dev))
         self.register_buffer("current_player",
                              torch.zeros(B, dtype=torch.uint8, device=dev))
         self.register_buffer("ko_points",
@@ -166,7 +159,7 @@ class TensorBoard(torch.nn.Module):
     @timed_method
     def legal_moves(self) -> BoardTensor:
         legal_mask, cap_info = self.legal_checker.compute_legal_moves_with_captures(
-            stones=self.stones,
+            board=self.board,
             current_player=self.current_player,
             ko_points=self.ko_points,
             return_capture_info=True,
@@ -185,19 +178,19 @@ class TensorBoard(torch.nn.Module):
         # ------------------------------------------------------------------ #
         # 1) Vectorised stone placement                                     #
         # ------------------------------------------------------------------ #
+
         mask_play = (positions[:, 0] >= 0) & (positions[:, 1] >= 0)
         if mask_play.any():
+            
+            # print(positions.device) 
             b_idx = mask_play.nonzero(as_tuple=True)[0]
             rows  = positions[b_idx, 0].long()
             cols  = positions[b_idx, 1].long()
             ply   = self.current_player[b_idx].long()
-            self.stones[b_idx, ply, rows, cols] = True
+            self.board[b_idx, rows, cols] = ply.to(self.board.dtype)   # int8 ← int8
+  
         else:
             b_idx = None  # no real moves this turn
-
-        # Early‑out if no capture info yet or nothing was played
-        if self._last_capture_info is None or b_idx is None:
-            return
 
         # ------------------------------------------------------------------ #
         # 2) Build capture mask in pure tensor code                         #
@@ -226,7 +219,9 @@ class TensorBoard(torch.nn.Module):
         # ------------------------------------------------------------------ #
         # 3) Clear captured stones & update ko                            #
         # ------------------------------------------------------------------ #
-        self.stones[b_idx, opp] &= ~cap_mask
+        self.board[b_idx] = torch.where(cap_mask,
+                                Stone.EMPTY,
+                                self.board[b_idx])
 
         single_cap = (total_caps[b_idx, rows, cols] == 1)
         if single_cap.any():
@@ -268,8 +263,9 @@ class TensorBoard(torch.nn.Module):
         # ------------------------------------------------------------------
         # 1) Flatten current stones into a single int8 board_state
         # ------------------------------------------------------------------
-        black = self.stones[:, 0].flatten(1)            # [B, H*W] – bool
-        white = self.stones[:, 1].flatten(1)            # [B, H*W] – bool
+        flat   = self.board.flatten(1)            # int8
+        black  = flat == Stone.BLACK
+        white  = flat == Stone.WHITE
 
         board_state = torch.full_like(black, -1, dtype=torch.int8)   # start as empty
         board_state[black]                   = 0                    # black stones
@@ -313,12 +309,12 @@ class TensorBoard(torch.nn.Module):
     # ------------------------------------------------------------------ #
     # Game state                                                         #
     # ------------------------------------------------------------------ #
-    def is_game_over(self) -> BatchTensor:
+    def is_game_over(self) -> PassTensor:
         return self.pass_count >= 2
 
     def compute_scores(self) -> Tensor:
-        black = self.stones[:, Stone.BLACK].sum((1, 2)).float()
-        white = self.stones[:, Stone.WHITE].sum((1, 2)).float()
+        black = (self.board == Stone.BLACK).sum((1, 2)).float()
+        white = (self.board == Stone.WHITE).sum((1, 2)).float()
         return torch.stack([black, white], dim=1)
 
     # ------------------------------------------------------------------ #

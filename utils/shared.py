@@ -158,20 +158,7 @@ def ensure_4d(tensor: Tensor) -> Tensor:
         tensor = tensor.unsqueeze(0)
     return tensor
 
-def ensure_3d(tensor: Tensor) -> Tensor:
-    """Ensure tensor is 3D by adding/removing dimensions as needed.
-    
-    Args:
-        tensor: Input tensor
-        
-    Returns:
-        3D tensor of shape (B, H, W)
-    """
-    if tensor.dim() == 2:
-        tensor = tensor.unsqueeze(0)
-    elif tensor.dim() == 4:
-        tensor = tensor.squeeze(1)
-    return tensor
+
 
 # ========================= BATCH UTILITIES =========================
 
@@ -404,88 +391,85 @@ def print_game_summary(stats) -> None:
 
 # Add this to utils/shared.py
 
-def save_game_histories_to_json(boards, num_games_to_save=5, output_dir="game_histories"):
-    """Save game histories to JSON files.
-    
-    Args:
-        boards: TensorBoard instance
-        num_games_to_save: Number of games to save (default: 5)
-        output_dir: Directory to save JSON files
+import json, os, torch
+
+def save_game_histories_to_json(
+    boards,
+    num_games_to_save: int = 5,
+    output_dir: str = "game_histories",
+) -> None:
     """
-    import json
-    import os
-    import torch
-    
-    # Create output directory if it doesn't exist
+    Dump up to *num_games_to_save* finished games from a TensorBoard batch
+    into individual JSON files.  Works with the refactored data structure:
+
+        boards.board  – (B, H, W) int8   (-1 = empty, 0 = black, 1 = white)
+    """
     os.makedirs(output_dir, exist_ok=True)
-    
-    history_size = boards.board_history.shape[1]
-    
-    for game_idx in range(min(num_games_to_save, boards.batch_size)):
-        num_moves = boards.move_count[game_idx].item()
-        available_moves = min(num_moves, history_size)
-        
-        # Build move sequence
+
+    B          = boards.batch_size
+    max_moves  = boards.board_history.shape[1]
+    N          = boards.board_size
+    board_area = N * N
+    dev        = boards.device
+
+    # Convenience constant for an "all empty" board
+    EMPTY = torch.full((board_area,), -1, dtype=torch.int8, device=dev)
+
+    for g in range(min(num_games_to_save, B)):
+        total_moves = int(boards.move_count[g])
+        recorded    = min(total_moves, max_moves)
+
+        prev = EMPTY
         moves = []
-        prev_board = torch.full((boards.board_size * boards.board_size,), -1, 
-                               dtype=torch.int8, device=boards.device)
-        
-        for move_num in range(available_moves):
-            curr_board = boards.board_history[game_idx, move_num]
-            diff = (curr_board != prev_board).nonzero(as_tuple=True)[0]
-            
-            move_info = {
-                "move_number": move_num + 1,
-                "board_state": curr_board.cpu().tolist(),
-                "changes": []
+
+        for m in range(recorded):
+            curr = boards.board_history[g, m]
+            diff = (curr != prev).nonzero(as_tuple=True)[0]
+
+            move_descr = {
+                "move_number": m + 1,
+                "board_state": curr.cpu().tolist(),
+                "changes": [],
             }
-            
-            # Identify what changed
-            for pos in diff:
-                flat_pos = pos.item()
-                row = flat_pos // boards.board_size
-                col = flat_pos % boards.board_size
-                old_val = prev_board[pos].item()
-                new_val = curr_board[pos].item()
-                
-                if old_val == -1 and new_val != -1:
-                    # Stone placed
-                    move_info["changes"].append({
-                        "type": "place",
-                        "position": [row, col],
-                        "color": "black" if new_val == 0 else "white"
-                    })
-                elif old_val != -1 and new_val == -1:
-                    # Stone captured
-                    move_info["changes"].append({
-                        "type": "capture",
-                        "position": [row, col],
-                        "color": "black" if old_val == 0 else "white"
-                    })
-            
-            if not move_info["changes"]:
-                move_info["changes"].append({"type": "pass"})
-            
-            moves.append(move_info)
-            prev_board = curr_board.clone()
-        
-        # Game summary
-        game_data = {
-            "game_id": game_idx,
-            "board_size": boards.board_size,
-            "total_moves": num_moves,
-            "moves_recorded": available_moves,
-            "truncated": num_moves > history_size,
-            "final_score": {
-                "black": int((boards.stones[game_idx, 0].sum().item())),
-                "white": int((boards.stones[game_idx, 1].sum().item()))
-            },
-            "moves": moves
+
+            if diff.numel() == 0:     # pure pass
+                move_descr["changes"].append({"type": "pass"})
+            else:
+                for pos in diff:
+                    row, col = divmod(int(pos), N)
+                    old = int(prev[pos])
+                    new = int(curr[pos])
+
+                    if old == -1 and new != -1:        # placement
+                        move_descr["changes"].append({
+                            "type": "place",
+                            "position": [row, col],
+                            "color": "black" if new == 0 else "white",
+                        })
+                    elif old != -1 and new == -1:      # capture
+                        move_descr["changes"].append({
+                            "type": "capture",
+                            "position": [row, col],
+                            "color": "black" if old == 0 else "white",
+                        })
+
+            moves.append(move_descr)
+            prev = curr.clone()
+
+        # --- final score: just count stones on the board -----------------
+        final_board = boards.board[g]           # (H, W) int8
+        black_stones = int((final_board == 0).sum().item())
+        white_stones = int((final_board == 1).sum().item())
+
+        game_json = {
+            "game_id": g,
+            "board_size": N,
+            "total_moves": total_moves,
+            "moves_recorded": recorded,
+            "truncated": total_moves > max_moves,
+            "final_score": {"black": black_stones, "white": white_stones},
+            "moves": moves,
         }
-        
-        # Save to JSON
-        filename = os.path.join(output_dir, f"game_{game_idx:03d}.json")
-        with open(filename, 'w') as f:
-            json.dump(game_data, f, indent=2)
-    
-    print(f"Saved {min(num_games_to_save, boards.batch_size)} game histories to {output_dir}/")
+
+        with open(os.path.join(output_dir, f"game_{g:03d}.json"), "w") as f:
+            json.dump(game_json, f, indent=2)

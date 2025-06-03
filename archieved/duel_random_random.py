@@ -71,13 +71,18 @@ def simulate_batch_games(
         print_timing_report(boards)
         print_performance_metrics(elapsed, ply, num_games)
     
-
+    # Show boards
+    if show_boards > 0:
+        print(f"\nShowing {min(show_boards, num_games)} final boards:")
+        step = max(1, num_games // show_boards)
+        for i in range(0, min(show_boards * step, num_games), step):
+            show(boards, header=f"Game {i + 1}", idx=i)
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=1024,
-        board_size=9,
-        history_factor=10,
+        num_games=2**13,
+        board_size=19,
+        history_factor=4,
         log_interval=2**6,
         show_boards=2,
         enable_timing=True,

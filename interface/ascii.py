@@ -5,16 +5,20 @@ EMPTY_POINT = "·"      # U+00B7
 
 
 def board_to_lines(board, idx: int = 0) -> list[str]:
-    """Return the board (idx) of a TensorBoard as list[str]."""
-    b = board.stones[idx, 0].cpu()
-    w = board.stones[idx, 1].cpu()
+    """
+    Return board *idx* of a TensorBoard as list[str].
+
+    Expects TensorBoard.board to be an int8 tensor (B, H, W) with values
+        -1 = empty , 0 = black , 1 = white
+    """
+    state = board.board[idx].cpu()          # (H, W) int8
     N = board.board_size
 
     lines = []
-    for r in range(N - 1, -1, -1):            # top → bottom
+    for r in range(N - 1, -1, -1):          # top → bottom
         row = [
-            BLACK_STONE if b[r, c] else
-            WHITE_STONE if w[r, c] else
+            BLACK_STONE if state[r, c] == 0 else
+            WHITE_STONE if state[r, c] == 1 else
             EMPTY_POINT
             for c in range(N)
         ]
@@ -24,7 +28,7 @@ def board_to_lines(board, idx: int = 0) -> list[str]:
 
 def show(board, *, header: str | None = None,
          idx: int = 0, out=print) -> None:
-    """Pretty-print one board (idx) from a TensorBoard batch."""
+    """Pretty-print one board (*idx*) from a TensorBoard batch."""
     if header:
         out(header)
     for line in board_to_lines(board, idx):
