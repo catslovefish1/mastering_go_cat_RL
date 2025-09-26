@@ -14,7 +14,7 @@ from utils.shared import (
 def simulate_batch_games(
     num_games=512,
     board_size=9,
-    history_factor=10,  # NEW: Controls history depth
+    history_factor=2,  # NEW: Controls history depth
     show_boards=0,
     log_interval=10,
     enable_timing=True,
@@ -45,7 +45,7 @@ def simulate_batch_games(
             # Log progress
             if log_interval and ply % log_interval == 0:
                 finished = boards.is_game_over()
-                finished_count = finished.sum().item()
+                finished_count = finished.sum().cpu()
                 print(f"Ply {ply:4d}: {finished_count}/{num_games} finished")
      
     elapsed = time.time() - t0
@@ -76,13 +76,26 @@ def simulate_batch_games(
 if __name__ == "__main__":
     simulate_batch_games(
         num_games=1024,
-        board_size=9,
-        history_factor=10,
+        board_size=5,
+        history_factor=20,
         log_interval=2**6,
         show_boards=2,
         enable_timing=True,
         save_history=True,
         num_games_to_save=5
     )
+    
+    
+    
+    
+    
+    
+    
+    # # Show boards
+    # if show_boards > 0:
+    #     print(f"\nShowing {min(show_boards, num_games)} final boards:")
+    #     step = max(1, num_games // show_boards)
+    #     for i in range(0, min(show_boards * step, num_games), step):
+    #         show(boards, header=f"Game {i + 1}", idx=i)
     
     

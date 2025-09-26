@@ -224,7 +224,7 @@ class VectorizedBoardChecker:
             parent_flat[gpos] = new_par
             parent_flat[gnbr] = new_par
             # Few halving passes for compression
-            for _ in range(5):
+            for _ in range(81):
                 parent_flat[:] = parent_flat[parent_flat]
             parent = parent_flat.view(B, N2)
 

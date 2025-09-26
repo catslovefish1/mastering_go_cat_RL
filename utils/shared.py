@@ -76,32 +76,6 @@ def create_pass_positions(batch_size: int, device: torch.device) -> Tensor:
     """
     return torch.full((batch_size, 2), -1, dtype=torch.int16, device=device)
 
-def is_pass_move(positions: Tensor) -> Tensor:
-    """Check which positions are pass moves.
-    
-    Args:
-        positions: Shape (B, 2) tensor of [row, col] positions
-        
-    Returns:
-        Shape (B,) boolean tensor - True for pass moves
-    """
-    return positions[:, 0] < 0
-
-# ========================= GAME STATE UTILITIES =========================
-
-def find_playable_games(legal_moves: Tensor) -> Tensor:
-    """Identify which games have at least one legal move.
-    
-    Args:
-        legal_moves: Shape (B, H, W) boolean mask of legal moves
-        
-    Returns:
-        Shape (B,) boolean mask - True where game has legal moves
-    """
-    # Flatten spatial dimensions and check if any legal move exists
-    batch_size = legal_moves.shape[0]
-    flat_legal = legal_moves.view(batch_size, -1)
-    return flat_legal.any(dim=1)
 
 # ========================= PROBABILITY UTILITIES =========================
 
@@ -143,63 +117,11 @@ def sample_from_mask(mask: Tensor, num_samples: int = 1) -> Tensor:
     
     return sampled
 
-# ========================= TENSOR SHAPE UTILITIES =========================
-
-def ensure_4d(tensor: Tensor) -> Tensor:
-    """Ensure tensor is 4D by adding singleton dimensions if needed.
-    
-    Args:
-        tensor: Input tensor of shape (H, W) or (B, H, W) or (B, C, H, W)
-        
-    Returns:
-        4D tensor of shape (B, C, H, W)
-    """
-    while tensor.dim() < 4:
-        tensor = tensor.unsqueeze(0)
-    return tensor
-
 
 
 # ========================= BATCH UTILITIES =========================
 
-def get_batch_indices(batch_size: int, device: torch.device) -> Tensor:
-    """Create tensor of batch indices [0, 1, 2, ..., batch_size-1].
-    
-    Args:
-        batch_size: Number of indices to create
-        device: Target device
-        
-    Returns:
-        Tensor of shape (batch_size,) with indices
-    """
-    return torch.arange(batch_size, device=device)
 
-def scatter_first_occurrence(
-    batch_idx: Tensor, 
-    values: Tensor, 
-    batch_size: int, 
-    default: int = -1
-) -> Tensor:
-    """For each batch, get the first occurrence of a value.
-    
-    Useful for finding single captures per batch in Ko detection.
-    
-    Args:
-        batch_idx: Batch indices for each value
-        values: Values to scatter
-        batch_size: Total number of batches
-        default: Default value for batches with no occurrence
-        
-    Returns:
-        Tensor of shape (batch_size,) with first value per batch
-    """
-    result = torch.full((batch_size,), default, dtype=values.dtype, device=values.device)
-    
-    # Reverse to ensure first occurrence wins (scatter keeps last)
-    reversed_idx = torch.arange(len(batch_idx) - 1, -1, -1, device=batch_idx.device)
-    result.scatter_(0, batch_idx[reversed_idx], values[reversed_idx])
-    
-    return result
 
 # ========================= TIMING UTILITIES =========================
 
