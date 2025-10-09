@@ -28,7 +28,7 @@ import torch
 # -----------------------------------------------------------------------------
 # Dtypes & sentinels
 # -----------------------------------------------------------------------------
-DTYPE_COLOR: torch.dtype = torch.int16   # stores -1/0/1
+DTYPE_COLOR: torch.dtype = torch.int8   # stores -1/0/1
 IDX_DTYPE:   torch.dtype = torch.int64   # indices / counts
 
 SENTINEL_NEIGH_COLOR = -2  # used for out-of-board neighbour color fills
@@ -153,7 +153,7 @@ class VectorizedBoardChecker:
         empty    = (board_f == -1)                   # (B, N2) bool
 
         # Union‑find (groups) & liberties per group
-        _parent, colour, roots, root_libs = self._batch_init_union_find(board_f)
+        parent, colour, roots, root_libs = self._batch_init_union_find(board_f)
 
         # Neighbour lookups (colour/roots) in flat space, with valid mask
         neigh_colors = self._get_neighbor_colors_batch(colour)   # (B,N2,4)
@@ -189,28 +189,51 @@ class VectorizedBoardChecker:
                                     dtype=IDX_DTYPE, device=self.device)
         capture_groups[can_capture] = neigh_roots[can_capture]             # (B,N2,4)
 
-        # Group sizes (count stones per root id)
-        sizes = torch.zeros((B, N2), dtype=IDX_DTYPE, device=self.device)
-        sizes.scatter_add_(1, roots, torch.ones_like(roots, dtype=IDX_DTYPE))
+        # # Group sizes (count stones per root id)
+        # sizes = torch.zeros((B, N2), dtype=IDX_DTYPE, device=self.device)
+        # sizes.scatter_add_(1, roots, torch.ones_like(roots, dtype=IDX_DTYPE))
 
-        # For captured neighbour roots, attach their sizes per direction
-        capture_sizes = torch.zeros_like(capture_groups)
-        valid_cap     = capture_groups >= 0
-        cap_flat      = capture_groups.view(B, -1)
-        valid_flat    = valid_cap.view(B, -1)
+        # # For captured neighbour roots, attach their sizes per direction
+        # capture_sizes = torch.zeros_like(capture_groups)
+        # valid_cap     = capture_groups >= 0
+        # cap_flat      = capture_groups.view(B, -1)
+        # valid_flat    = valid_cap.view(B, -1)
 
-        sizes_flat    = sizes.gather(1, cap_flat.clamp(min=0))
-        capture_sizes.view(B, -1)[valid_flat] = sizes_flat[valid_flat]
+        # sizes_flat    = sizes.gather(1, cap_flat.clamp(min=0))
+        # capture_sizes.view(B, -1)[valid_flat] = sizes_flat[valid_flat]
 
-        total_captures = capture_sizes.sum(dim=2).view(B, H, W)             # (B,H,W)
+        # Create a direct capture stone mask that shows exactly which stones would be captured
+        # This automatically excludes empty positions and the placed stone itself
+        
+        # Step 1: Expand capture_groups to compare against all roots
+        capture_groups_exp = capture_groups.view(B, N2, 4, 1)  # (B, N2, 4, 1)
+        roots_exp = roots.view(B, 1, 1, N2)  # (B, 1, 1, N2)
+        
+        # Step 2: Find which stones belong to captured groups
+        # Only matches where capture_groups >= 0 (valid groups) and roots match
+        group_matches = (capture_groups_exp == roots_exp) & (capture_groups_exp >= 0)
+        
+        # Step 3: Aggregate across directions (any direction capturing counts)
+        capture_stone_mask = group_matches.any(dim=2)  # (B, N2, N2)
+        
+        # Step 4: Apply opponent-only filter
+        # Only opponent stones can be captured (colour != current_player and != empty)
+        opp_colour = 1 - current_player.view(B, 1)  # (B, 1)
+        is_opponent_stone = (colour == opp_colour)  # (B, N2)
+        
+        # Broadcast to apply opponent filter
+        capture_stone_mask = capture_stone_mask & is_opponent_stone.view(B, 1, N2)
+        
+        # Step 5: Ensure diagonal is False (stone can't capture itself - belt and braces)
+        diag_indices = torch.arange(N2, device=self.device)
+        capture_stone_mask[:, diag_indices, diag_indices] = False
 
         capture_info: Dict[str, torch.Tensor] = {
-            "would_capture" : (legal_flat & can_capture_any).view(B, H, W),
-            "capture_groups": capture_groups.view(B, H, W, 4),
-            "capture_sizes" : capture_sizes.view(B, H, W, 4),
-            "total_captures": total_captures,
+            # "would_capture" : (legal_flat & can_capture_any).view(B, H, W),
+            # "capture_sizes" : capture_sizes.view(B, H, W, 4),   # Keep for compatibility
             "roots"         : roots,     # (B,N2)
-            "colour"        : colour,    # (B,N2)
+            # "colour"        : colour,    # (B,N2)
+            "capture_stone_mask": capture_stone_mask,  # (B,N2,N2) - exact stones to capture
         }
         return legal_mask, capture_info
 
@@ -249,11 +272,10 @@ class VectorizedBoardChecker:
 
     def _hook_and_compress(self, parent: torch.Tensor, same: torch.Tensor) -> torch.Tensor:
         B, N2 = parent.shape
-        dev   = parent.device
         nbr_idx  = self.NEIGH_IDX.view(1, N2, 4).expand(B, -1, -1)
-        max_rounds = int((N2 - 1).bit_length())
+        max_rounds = int((N2).bit_length())+6
 
-        for _ in range(max_rounds):
+        for i in range(max_rounds):
             parent_prev = parent
             nbr_parent = torch.gather(parent, 1, nbr_idx.clamp(min=0).reshape(B, -1)).view(B, N2, 4)
             nbr_parent = torch.where(same, nbr_parent, torch.full_like(nbr_parent, N2))
@@ -261,8 +283,11 @@ class VectorizedBoardChecker:
             hooked = torch.minimum(parent, min_nbr_parent)
             comp   = torch.gather(hooked, 1, hooked)
             comp2  = torch.gather(comp,   1, comp)
-            if torch.equal(comp2, parent_prev):
-                return comp2
+            
+            # <-- add convergence check
+            if (i & 3) == 3:  # every 4th iter
+                if torch.equal(comp2, parent_prev):
+                    return comp2
             parent = comp2
         return parent
     
@@ -278,55 +303,51 @@ class VectorizedBoardChecker:
 
         # Colours in fixed dtype (no changes to values)
         colour = board_f.to(DTYPE_COLOR)                                    # (B,N2)
+                             # (B,N2)
 
-        # Start with identity parents per row (local ids 0..N2-1)
-        parent = torch.arange(N2, dtype=IDX_DTYPE, device=dev) \
-                     .expand(B, N2).clone()                                # (B,N2)
-
-        # Same‑colour adjacency mask
+        # Same-colour adjacency mask (compute once)
         neigh_cols = self._get_neighbor_colors_batch(colour)                # (B,N2,4)
         same = (neigh_cols == colour.unsqueeze(2)) \
                & (colour.unsqueeze(2) != -1) \
                & self.NEIGH_VALID.view(1, N2, 4)                            # (B,N2,4)
 
-        # Replace the one-shot hook with iterative relaxation
-        parent = torch.arange(N2, dtype=IDX_DTYPE, device=dev).expand(B, N2).clone()
-
+        # Initialize parents once, then compress
+        parent = torch.arange(N2, dtype=IDX_DTYPE, device=dev).expand(B, N2)
         parent = self._hook_and_compress(parent, same)
-        roots = parent.clone()                                              # (B,N2)
+        roots = parent                                                       # (B,N2)
 
         # ---- Count unique liberties per root ----
-        neigh_cols2 = self._get_neighbor_colors_batch(colour)               # (B,N2,4)
+        neigh_cols2 = neigh_cols              # (B,N2,4)
         is_lib      = (neigh_cols2 == -1) & self.NEIGH_VALID.view(1, N2, 4) # (B,N2,4)
         stone_mask  = (colour != -1)                                        # (B,N2)
 
         libs_per_root = torch.zeros(B * N2, dtype=IDX_DTYPE, device=dev)    # (B*N2,)
 
-        if stone_mask.any():
-            batch_map = torch.arange(B, dtype=IDX_DTYPE, device=dev).view(B, 1, 1)
-            roots_exp = roots.unsqueeze(2)                                  # (B,N2,1)
-            lib_idx   = self.NEIGH_IDX.view(1, N2, 4)                       # (1,N2,4)
-            mask      = is_lib & stone_mask.unsqueeze(2)                    # (B,N2,4)
 
-            fb = batch_map.expand_as(mask)[mask]                            # (K,)
-            fr = roots_exp.expand_as(mask)[mask]                            # (K,)
-            fl = lib_idx.expand_as(mask)[mask]                              # (K,)
+        batch_map = torch.arange(B, dtype=IDX_DTYPE, device=dev).view(B, 1, 1)
+        roots_exp = roots.unsqueeze(2)                                  # (B,N2,1)
+        lib_idx   = self.NEIGH_IDX.view(1, N2, 4)                       # (1,N2,4)
+        mask      = is_lib & stone_mask.unsqueeze(2)                    # (B,N2,4)
 
-            key_root = fb * N2 + fr
-            key_lib  = fb * N2 + fl
-            pairs    = torch.stack((key_root, key_lib), dim=1)              # (K,2)
+        fb = batch_map.expand_as(mask)[mask]                            # (K,)
+        fr = roots_exp.expand_as(mask)[mask]                            # (K,)
+        fl = lib_idx.expand_as(mask)[mask]                              # (K,)
+
+        key_root = fb * N2 + fr
+        key_lib  = fb * N2 + fl
+        pairs    = torch.stack((key_root, key_lib), dim=1)              # (K,2)
 
             # Deduplicate by (root, liberty point)
             # Sort by both columns to ensure identical pairs are consecutive
             # First create a single sort key: root * (N2*B) + lib
-            sort_key = pairs[:, 0] * (N2 * B) + pairs[:, 1]
-            sorted_idx = sort_key.argsort()
-            pairs_sorted = pairs[sorted_idx]
-            uniq  = torch.unique_consecutive(pairs_sorted, dim=0)
+        sort_key = pairs[:, 0] * (N2 * B) + pairs[:, 1]
+        sorted_idx = sort_key.argsort()
+        pairs_sorted = pairs[sorted_idx]
+        uniq  = torch.unique_consecutive(pairs_sorted, dim=0)
             # On cuda, we can directly use unique
             # uniq  = torch.unique(pairs, dim=0)
 
-            libs_per_root.scatter_add_(0, uniq[:, 0],
+        libs_per_root.scatter_add_(0, uniq[:, 0],
                                        torch.ones_like(uniq[:, 0], dtype=IDX_DTYPE))
 
         root_libs = libs_per_root.reshape(B, N2)                            # (B,N2)

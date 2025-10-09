@@ -15,6 +15,7 @@ def simulate_batch_games(
     num_games=512,
     board_size=9,
     history_factor=2,  # NEW: Controls history depth
+    show_boards=0,
     enable_super_ko = True,
     log_interval=10,
     enable_timing=True,
@@ -75,10 +76,10 @@ def simulate_batch_games(
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=5,
-        board_size=3,
-        history_factor=20,
-        log_interval=2**4,
+        num_games=2**11,
+        board_size=19,
+        history_factor=2,
+        log_interval=2**6,
         show_boards=2,
         enable_timing=True,
         save_history=True,
