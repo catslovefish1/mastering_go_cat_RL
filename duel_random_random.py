@@ -15,7 +15,7 @@ def simulate_batch_games(
     num_games=512,
     board_size=9,
     history_factor=2,  # NEW: Controls history depth
-    show_boards=0,
+    enable_super_ko = True,
     log_interval=10,
     enable_timing=True,
     save_history=True,
@@ -26,7 +26,7 @@ def simulate_batch_games(
     print(f"Running {num_games} games on {board_size}×{board_size} ({device})")
     
     # Create boards and bot
-    boards = TensorBoard(num_games, board_size, history_factor, device, enable_timing)
+    boards = TensorBoard(num_games, board_size, history_factor, device, enable_timing,enable_super_ko)
     bot = TensorBatchBot(device)
     
     # Play games
@@ -75,13 +75,14 @@ def simulate_batch_games(
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=1024,
-        board_size=5,
+        num_games=5,
+        board_size=3,
         history_factor=20,
-        log_interval=2**6,
+        log_interval=2**4,
         show_boards=2,
         enable_timing=True,
         save_history=True,
+        enable_super_ko = True,
         num_games_to_save=5
     )
     

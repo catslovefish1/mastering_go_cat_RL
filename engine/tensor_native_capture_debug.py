@@ -192,8 +192,60 @@ class TensorBoard(torch.nn.Module):
         self._last_legal_mask   = None
         self._last_capture_info = None
 
+    # ---------- DEBUG HELPERS (no logic changes) ----------
+    def _sym(self, v: int) -> str:
+        return "." if v == Stone.EMPTY else ("X" if v == Stone.BLACK else "O")
 
-    
+    def _pprint_board(self, title: str = "") -> None:
+        b = self.board[0].to("cpu").numpy()
+        H, W = b.shape
+        if title:
+            print(f"\n{title}")
+        print("     " + " ".join(f"{c:2d}" for c in range(W)))
+        print("     " + "--" * W)
+        for r in range(H):
+            row = " ".join(f"{self._sym(int(b[r,c])):>2}" for c in range(W))
+            print(f"{r:2d} | {row}")
+        print("\nLegend: X=Black, O=White, .=Empty")
+
+    def _first_coords(self, mask_2d: torch.Tensor, k: int = 24):
+        """Return up to k (r,c) coords where mask_2d is True (for printing)."""
+        idx = torch.nonzero(mask_2d, as_tuple=False)
+        idx = idx[:k]
+        return [(int(r.item()), int(c.item())) for r, c in idx]
+
+    def _debug_trace_place(
+        self,
+        b_idx: torch.Tensor,         # (M,)
+        rows: torch.Tensor,          # (M,)
+        cols: torch.Tensor,          # (M,)
+        ply: torch.Tensor,           # (M,)
+        groups_at_moves: torch.Tensor,  # (M,4)
+        cap_mask_2d_before_apply: torch.Tensor,  # (M,H,W)
+        title: str,
+    ) -> None:
+        H = W = self.board_size
+        print("\n" + "=" * 80)
+        print(title)
+        print("=" * 80)
+        if self.batch_size == 1:
+            self._pprint_board("Board BEFORE placement/removal")
+
+        M = b_idx.numel()
+        for m in range(M):
+            b = int(b_idx[m].item())
+            r = int(rows[m].item())
+            c = int(cols[m].item())
+            p = int(ply[m].item())
+            roots_dirs = [int(x) for x in groups_at_moves[m].tolist()]
+            cap_cnt = int(cap_mask_2d_before_apply[m].sum().item())
+            print(f"\nMove {m}: batch={b} play={'B' if p==0 else 'W'} at ({r},{c})")
+            print(f"  capture_groups [N,S,W,E] = {roots_dirs}")
+            print(f"  cap_mask true count      = {cap_cnt}")
+            if cap_cnt > 0:
+                coords = self._first_coords(cap_mask_2d_before_apply[m], k=24)
+                print(f"  cap_mask sample coords   = {coords}{' ...' if cap_cnt>24 else ''}")
+        print("=" * 80)
 
     # ==================== LEGAL MOVES ======================================= #
 
@@ -370,6 +422,17 @@ class TensorBoard(torch.nn.Module):
         cap_mask_2d = cap_mask.view(M, H, W)                   # (M,H,W)
         cap_mask_2d[torch.arange(M, device=self.device), rows, cols] = False
 
+        # -------------- DEBUG TRACE (before mutating board) --------------
+        if self.debug_place_trace:
+            self._debug_trace_place(
+                b_idx=b_idx,
+                rows=rows,
+                cols=cols,
+                ply=ply,
+                groups_at_moves=groups_at_moves,
+                cap_mask_2d_before_apply=cap_mask_2d,
+                title="TRACE: place-stones (pre-apply)"
+            )
 
         # --- Incremental hash update BEFORE mutating the board (unchanged) ---
         if self.enable_super_ko:

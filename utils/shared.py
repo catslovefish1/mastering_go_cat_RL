@@ -311,7 +311,7 @@ def print_game_summary(stats) -> None:
     print(f"Draws     : {stats.draws:4d} ({stats.draw_rate:6.1%})")
     
 
-# Add this to utils/shared.py
+import json, os, torch
 
 import json, os, torch
 
@@ -324,7 +324,17 @@ def save_game_histories_to_json(
     Dump up to *num_games_to_save* finished games from a TensorBoard batch
     into individual JSON files.  Works with the refactored data structure:
 
-        boards.board  – (B, H, W) int8   (-1 = empty, 0 = black, 1 = white)
+        boards.board         – (B, H, W) int8   (-1 empty, 0 black, 1 white)
+        boards.board_history – (B, T, N2) int8  snapshots taken *before* each move
+        boards.hash_history  – (B, T)   int64   Zobrist hash of the same snapshots
+        boards.current_hash  – (B,)     int64   hash of the *current* board
+
+    Notes on hashes:
+    - For move m (1-based in the JSON), we emit:
+        pre_hash  = hash of the board before move m  (hash_history[g, m-1])
+        post_hash = hash of the board after  move m  (hash_history[g, m]
+                                                      if exists, else current_hash[g])
+    - This keeps hashes aligned with what board_history already stores (pre-move states).
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -334,33 +344,53 @@ def save_game_histories_to_json(
     board_area = N * N
     dev        = boards.device
 
-    # Convenience constant for an "all empty" board
+    # Optional (present only if super-ko was enabled)
+    has_hash_hist = hasattr(boards, "hash_history") and boards.hash_history is not None
+    has_curr_hash = hasattr(boards, "current_hash") and boards.current_hash is not None
+
+    # Convenience constant for an "all empty" board (pre-previous state)
     EMPTY = torch.full((board_area,), -1, dtype=torch.int8, device=dev)
 
     for g in range(min(num_games_to_save, B)):
-        total_moves = int(boards.move_count[g])
+        total_moves = int(boards.move_count[g].item()) if hasattr(boards.move_count, "device") else int(boards.move_count[g])
         recorded    = min(total_moves, max_moves)
 
         prev = EMPTY
         moves = []
 
         for m in range(recorded):
-            curr = boards.board_history[g, m]
+            # Pre-move board snapshot at ply m (0-based)
+            curr = boards.board_history[g, m]                       # (N2,) int8
+
+            # Per-move hashes (pre/post)
+            pre_hash  = int(boards.hash_history[g, m].item()) if has_hash_hist else None
+            if has_hash_hist:
+                # post_hash is the next pre-snapshot if it exists, else current board hash
+                if m + 1 < max_moves and (m + 1) < recorded:
+                    post_hash = int(boards.hash_history[g, m + 1].item())
+                else:
+                    post_hash = int(boards.current_hash[g].item()) if has_curr_hash else None
+            else:
+                post_hash = None
+
+            # Diff vs previous snapshot → changes introduced by the *last* move
             diff = (curr != prev).nonzero(as_tuple=True)[0]
 
             move_descr = {
                 "move_number": m + 1,
-                "board_state": curr.cpu().tolist(),
+                "board_state": curr.detach().cpu().tolist(),
                 "changes": [],
+                "pre_hash":  pre_hash,
+                "post_hash": post_hash,
             }
 
             if diff.numel() == 0:     # pure pass
                 move_descr["changes"].append({"type": "pass"})
             else:
-                for pos in diff:
+                for pos in diff.tolist():
                     row, col = divmod(int(pos), N)
-                    old = int(prev[pos])
-                    new = int(curr[pos])
+                    old = int(prev[pos].item())
+                    new = int(curr[pos].item())
 
                     if old == -1 and new != -1:        # placement
                         move_descr["changes"].append({
@@ -374,6 +404,14 @@ def save_game_histories_to_json(
                             "position": [row, col],
                             "color": "black" if old == 0 else "white",
                         })
+                    else:
+                        # Rare but possible if something rewrites stones directly
+                        move_descr["changes"].append({
+                            "type": "flip",
+                            "position": [row, col],
+                            "from": "empty" if old == -1 else ("black" if old == 0 else "white"),
+                            "to":   "empty" if new == -1 else ("black" if new == 0 else "white"),
+                        })
 
             moves.append(move_descr)
             prev = curr.clone()
@@ -383,6 +421,9 @@ def save_game_histories_to_json(
         black_stones = int((final_board == 0).sum().item())
         white_stones = int((final_board == 1).sum().item())
 
+        # Final hash (current board)
+        final_hash = int(boards.current_hash[g].item()) if has_curr_hash else None
+
         game_json = {
             "game_id": g,
             "board_size": N,
@@ -390,6 +431,7 @@ def save_game_histories_to_json(
             "moves_recorded": recorded,
             "truncated": total_moves > max_moves,
             "final_score": {"black": black_stones, "white": white_stones},
+            "final_hash": final_hash,
             "moves": moves,
         }
 

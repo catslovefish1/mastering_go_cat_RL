@@ -316,18 +316,41 @@ class VectorizedBoardChecker:
             key_lib  = fb * N2 + fl
             pairs    = torch.stack((key_root, key_lib), dim=1)              # (K,2)
 
+            # DEBUG: Print pairs before deduplication for Root 0
+            if B == 1 and N2 == 25:  # Only for our test case (5x5 board, batch=1)
+                # Find pairs for root 0
+                root_0_pairs = pairs[pairs[:, 0] == 0]  # key_root == 0 means batch 0, root 0
+                if root_0_pairs.shape[0] > 0:
+                    print("\n[DEBUG] Liberty pairs for Root 0 before deduplication:")
+                    for i, (root_key, lib_key) in enumerate(root_0_pairs):
+                        lib_idx_actual = lib_key.item() % N2
+                        print(f"  Pair {i}: root_key={root_key.item()}, lib_key={lib_key.item()}, liberty_idx={lib_idx_actual}")
+
             # Deduplicate by (root, liberty point)
-            # Sort by both columns to ensure identical pairs are consecutive
-            # First create a single sort key: root * (N2*B) + lib
-            sort_key = pairs[:, 0] * (N2 * B) + pairs[:, 1]
-            sorted_idx = sort_key.argsort()
-            pairs_sorted = pairs[sorted_idx]
-            uniq  = torch.unique_consecutive(pairs_sorted, dim=0)
-            # On cuda, we can directly use unique
-            # uniq  = torch.unique(pairs, dim=0)
+            pairs = pairs[pairs[:, 1].argsort()]
+            uniq  = torch.unique_consecutive(pairs, dim=0)
+
+            # DEBUG: Print unique pairs for Root 0
+            if B == 1 and N2 == 25:
+                root_0_uniq = uniq[uniq[:, 0] == 0]
+                if root_0_uniq.shape[0] > 0:
+                    print(f"\n[DEBUG] Unique liberty pairs for Root 0 after deduplication:")
+                    for i, (root_key, lib_key) in enumerate(root_0_uniq):
+                        lib_idx_actual = lib_key.item() % N2
+                        lib_row, lib_col = lib_idx_actual // 5, lib_idx_actual % 5
+                        print(f"  Unique pair {i}: root_key={root_key.item()}, lib_key={lib_key.item()}, liberty at [{lib_row},{lib_col}]")
+                    print(f"  Total unique liberties for Root 0: {root_0_uniq.shape[0]}")
 
             libs_per_root.scatter_add_(0, uniq[:, 0],
                                        torch.ones_like(uniq[:, 0], dtype=IDX_DTYPE))
+            
+            # DEBUG: Check what scatter_add actually did
+            if B == 1 and N2 == 25:
+                print(f"\n[DEBUG] libs_per_root[0] after scatter_add: {libs_per_root[0].item()}")
 
         root_libs = libs_per_root.reshape(B, N2)                            # (B,N2)
+        
+        # DEBUG: Final check
+        if B == 1 and N2 == 25:
+            print(f"[DEBUG] Final root_libs[0, 0]: {root_libs[0, 0].item()}")
         return parent, colour, roots, root_libs
