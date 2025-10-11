@@ -3,352 +3,286 @@
 GoLegalMoveChecker.py – board-plane edition (readability pass)
 =============================================================
 
-Drop‑in replacement for your existing module. Same public API, clearer names,
-explicit shapes, and a batched, **row‑safe** pointer‑jumping step (no cross‑
-board leakage). Logic is unchanged except for fixing that bug.
+Drop-in replacement for your existing module. Same public API, clearer names,
+explicit shapes, and a batched, row-safe pointer-jumping step.
 
-Board representation
---------------------
-- board: (B, H, W) int8 with values: -1 empty, 0 black, 1 white
-- Internally we often work on the flattened grid graph: N2 = H*W
-
-Notes
+Board
 -----
-- Union‑find uses one vectorised hook sweep + a few per‑row pointer jumps.
-- Uses precomputed neighbour tables in flat space.
-
+- board: (B, H, W) int8 with values: -1 empty, 0 black, 1 white
+- Internally we work on a flattened grid: N2 = H * W
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Union
-
 import torch
 
 # -----------------------------------------------------------------------------
 # Dtypes & sentinels
 # -----------------------------------------------------------------------------
-DTYPE_COLOR: torch.dtype = torch.int8   # stores -1/0/1
-IDX_DTYPE:   torch.dtype = torch.int64   # indices / counts
+DTYPE_COLOR: torch.dtype = torch.int8
+IDX_DTYPE:   torch.dtype = torch.int64
 
-SENTINEL_NEIGH_COLOR = -2  # used for out-of-board neighbour color fills
-SENTINEL_NEIGH_ROOT  = -1  # used for out-of-board neighbour root fills
+SENTINEL_NEIGH_COLOR = -2  # off-board neighbour color fill
+SENTINEL_NEIGH_ROOT  = -1  # off-board neighbour root fill
 
-# -----------------------------------------------------------------------------
-# Small layout helper for 2D<->1D conversions (readability only)
-# -----------------------------------------------------------------------------
-@dataclass(frozen=True)
-class BoardLayout:
-    B: int
-    H: int
-    W: int
-
-    @property
-    def N2(self) -> int:
-        return self.H * self.W
-
-    def flatten(self, x: torch.Tensor) -> torch.Tensor:
-        """(B,H,W)->(B,N2) or passthrough for already flat (B,N2)."""
-        return x.reshape(self.B, self.N2)
-
-    def unflatten(self, x: torch.Tensor) -> torch.Tensor:
-        """(B,N2)->(B,H,W)."""
-        return x.reshape(self.B, self.H, self.W)
 
 # =============================================================================
 # Public API
 # =============================================================================
 class GoLegalMoveChecker:
-    """Vectorised legal‑move checker with capture detection for Go."""
+    def __init__(self, board_size=19, device=None):
+        self._checker = VectorizedBoardChecker(board_size, device)
 
-    def __init__(
-        self,
-        board_size: int = 19,
-        device: Optional[torch.device] = None,
-    ):
-        self.board_size = board_size
-        self.N2         = board_size * board_size
-        self.device     = device
+    def compute_batch_legal_and_info(self, board, current_player, return_info=True):
+        B,H,W = board.shape
+        assert H == W == self._checker.board_size, "board size mismatch"
+        legal, info = self._checker.compute_batch_legal_and_info(board, current_player)
+        return (legal, info) if return_info else legal
 
-        self._checker = VectorizedBoardChecker(board_size, self.device)
-
-    @torch.inference_mode()
-    def compute_legal_moves_with_captures(
-        self,
-        board: torch.Tensor,               # (B, H, W)  int8   –-1/0/1
-        current_player: torch.Tensor,      # (B,)        uint8  0/1
-        return_capture_info: bool = True,
-    ) -> Union[torch.Tensor,
-               Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-        """
-        Compute legal‑move mask (and capture metadata) for each board.
-
-        Returns
-        -------
-        legal_mask : (B, H, W) bool
-        capture_info : dict (only if *return_capture_info* is True)
-        """
-        B, H, W = board.shape
-        assert H == self.board_size and W == self.board_size, "board size mismatch"
-
-        legal_mask, capture_info = self._checker.compute_batch_legal_and_captures(
-            board, current_player
-        )
-
-        return (legal_mask, capture_info) if return_capture_info else legal_mask
 
 
 # =============================================================================
-# Batch‑vectorised board checker
+# Batched implementation
 # =============================================================================
 class VectorizedBoardChecker:
     """
-    Fully batched legal‑move logic with capture detection.
-    Works directly on *(B, H, W)* int8 boards (-1/0/1), but flattens internally
-    for graph operations (N2 = H*W).
+    Fully batched legal-move logic with capture detection.
+    Works on (B,H,W) int8 boards, flattens to (B,N2) internally.
     """
 
-    # Direction order: N, S, W, E
-    OFFSETS_ORDER = ("N", "S", "W", "E")
+    # Per-board (flatten) structures
+    index_flatten: torch.Tensor          # (N2,)
+    neigh_index_flatten: torch.Tensor    # (N2,4) int64
+    neigh_valid_flatten: torch.Tensor    # (N2,4) bool
 
-    def __init__(self, board_size: int, device: torch.device | None):
+    # Per-call (runtime) data
+    board_flatten: torch.Tensor          # (B,N2), set each call
+
+    def __init__(self, board_size: int, device: Optional[torch.device]):
         self.board_size = board_size
         self.N2         = board_size * board_size
         self.device     = device
-        self._init_neighbor_structure()
+        self._init_board_fallten_structure()
 
     # ------------------------------------------------------------------
-    # Precomputed neighbours in flat space
+    # Precomputed 4-neighbour tables in flat space
     # ------------------------------------------------------------------
-    def _init_neighbor_structure(self) -> None:
-        N  = self.board_size
-        N2 = self.N2
-        dev = self.device
+    def _init_board_fallten_structure(self) -> None:
+        N, N2, dev = self.board_size, self.N2, self.device
 
-        OFF  = torch.tensor([-N, N, -1, 1], dtype=IDX_DTYPE, device=dev)   # (4,)
-        flat = torch.arange(N2, dtype=IDX_DTYPE, device=dev)                # (N2,)
-        nbrs = flat[:, None] + OFF                                          # (N2,4)
+        # (N2,) flat indices of a single board
+        self.index_flatten = torch.arange(N2, dtype=IDX_DTYPE, device=dev)
 
-        valid = (nbrs >= 0) & (nbrs < N2)
-        col   = flat % N
-        valid[:, 2] &= col != 0       # W blocked on left edge
-        valid[:, 3] &= col != N - 1   # E blocked on right edge
+        # (N2,4) neighbours via offsets: N,S,W,E
+        OFF  = torch.tensor([-N, N, -1, 1], dtype=IDX_DTYPE, device=dev)    # (4,)
+        nbrs = self.index_flatten[:, None] + OFF                             # (N2,4)
 
-        self.NEIGH_IDX   = torch.where(valid, nbrs, torch.full_like(nbrs, -1))  # (N2,4)
-        self.NEIGH_VALID = valid                                                 # (N2,4) bool
+        # Edge handling
+        valid = (nbrs >= 0) & (nbrs < N2)                                    # (N2,4)
+        col   = self.index_flatten % N
+        valid[:, 2] &= col != 0           # W invalid at left edge
+        valid[:, 3] &= col != N - 1       # E invalid at right edge
+
+        self.neigh_index_flatten = torch.where(valid, nbrs, torch.full_like(nbrs, -1))
+        self.neigh_valid_flatten = valid
 
     # ------------------------------------------------------------------
-    # Top‑level batch computation
+    # Top-level: legal mask + capture metadata
     # ------------------------------------------------------------------
-    def compute_batch_legal_and_captures(
+    def compute_batch_legal_and_info(
         self,
-        board: torch.Tensor,          # (B, H, W)  int8  –-1/0/1
-        current_player: torch.Tensor  # (B,)        uint8 0/1
+        board: torch.Tensor,          # (B,H,W) int8 in {-1,0,1}
+        current_player: torch.Tensor  # (B,)    uint8 in {0,1}
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, H, W = board.shape
-        layout = BoardLayout(B, H, W)
-        N2 = layout.N2
+        N2      = self.N2
 
-        board_f  = layout.flatten(board)             # (B, N2) int8
-        empty    = (board_f == -1)                   # (B, N2) bool
+        # Per-call runtime flatten (depends on B)
+        self.board_flatten = board.reshape(B, N2)         # (B,N2)
+        empty              = (self.board_flatten == -1)   # (B,N2) bool
 
-        # Union‑find (groups) & liberties per group
-        parent, colour, roots, root_libs = self._batch_init_union_find(board_f)
+        # Groups (roots) + liberties   (pass board_flatten instead of “colour”)
+        roots, root_libs = self._batch_init_union_find()  # (B,N2) each
 
-        # Neighbour lookups (colour/roots) in flat space, with valid mask
-        neigh_colors = self._get_neighbor_colors_batch(colour)   # (B,N2,4)
-        neigh_roots  = self._get_neighbor_roots_batch(roots)     # (B,N2,4)
-        valid_mask   = self.NEIGH_VALID.view(1, N2, 4)
+        # Batched neighbour tables
+        neigh_valid_flatten_b = self.neigh_valid_flatten.view(1, N2, 4).expand(B, -1, -1)
+
+        # Neighbour colors/roots (colors are read from self.board_flatten)
+        neigh_colors = self._get_neighbor_colors_batch()  # (B,N2,4)
+        neigh_roots  = self._get_neighbor_roots_batch(roots)  # (B,N2,4)
 
         curr = current_player.view(B, 1, 1)  # (B,1,1)
         opp  = 1 - curr
 
-        # Immediate liberties if we play here (pre‑move): any adjacent empty?
-        has_any_lib = ((neigh_colors == -1) & valid_mask).any(dim=2)       # (B,N2)
+        # A) immediate liberties
+        has_any_lib = ((neigh_colors == -1) & neigh_valid_flatten_b).any(dim=2)   # (B,N2)
 
-        # For each neighbour, gather that group's liberty count
-        neigh_roots_f = neigh_roots.reshape(B, -1)                         # (B,N2*4)
-        neigh_libs_f  = root_libs.gather(1, neigh_roots_f.clamp(min=0))    # (B,N2*4)
-        neigh_libs    = neigh_libs_f.view(B, N2, 4)                        # (B,N2,4)
+        # B) captures: adjacent opponent group with exactly 1 liberty
+        neigh_roots_f = neigh_roots.reshape(B, -1)                                 # (B,N2*4)
+        neigh_libs_f  = root_libs.gather(1, neigh_roots_f.clamp(min=0))            # (B,N2*4)
+        neigh_libs    = neigh_libs_f.view(B, N2, 4)                                 # (B,N2,4)
 
-        # Captures: neighbouring opponent group with exactly 1 liberty
-        opp_mask        = (neigh_colors == opp) & valid_mask               # (B,N2,4)
-        can_capture     = opp_mask & (neigh_libs == 1)                     # (B,N2,4)
-        can_capture_any = can_capture.any(dim=2)                            # (B,N2)
+        opp_mask        = (neigh_colors == opp) & neigh_valid_flatten_b             # (B,N2,4) bool
+        can_capture     = opp_mask & (neigh_libs == 1)                              # (B,N2,4)
+        can_capture_any = can_capture.any(dim=2)                                    # (B,N2)
 
-        # Friendly attachment that is safe immediately (>1 liberties pre‑move)
-        friendly        = (neigh_colors == curr) & valid_mask              # (B,N2,4)
-        friendly_any    = (friendly & (neigh_libs > 1)).any(dim=2)         # (B,N2)
+        # C) friendly safe attachment
+        friendly     = (neigh_colors == curr) & neigh_valid_flatten_b               # (B,N2,4)
+        friendly_any = (friendly & (neigh_libs > 1)).any(dim=2)                     # (B,N2)
 
-        # Final legality: empty AND (has_lib OR captures OR safe_friendly)
+        # D) final legality
         legal_flat = empty & (has_any_lib | can_capture_any | friendly_any)
-        legal_mask = legal_flat.view(B, H, W)
+        legal_mask = legal_flat.view(B, H, W)                                       # (B,H,W)
 
-        # ----- Capture meta‑data for engine (roots to delete, and sizes) -----
-        capture_groups = torch.full((B, N2, 4), SENTINEL_NEIGH_ROOT,
-                                    dtype=IDX_DTYPE, device=self.device)
-        capture_groups[can_capture] = neigh_roots[can_capture]             # (B,N2,4)
+        # ----- Capture metadata: exact stones removed for each play -----
+        capture_groups = torch.full(
+            (B, N2, 4), SENTINEL_NEIGH_ROOT, dtype=IDX_DTYPE, device=self.device
+        )                                                                           # (B,N2,4)
+        capture_groups = torch.where(can_capture, neigh_roots, capture_groups)
 
-        # # Group sizes (count stones per root id)
-        # sizes = torch.zeros((B, N2), dtype=IDX_DTYPE, device=self.device)
-        # sizes.scatter_add_(1, roots, torch.ones_like(roots, dtype=IDX_DTYPE))
+        # Compare candidate capture roots vs all roots to mark stones
+        capture_groups_exp = capture_groups.view(B, N2, 4, 1)                       # (B,N2,4,1)
+        roots_exp          = roots.view(B, 1, 1, N2)                                # (B,1,1,N2)
+        group_matches      = (capture_groups_exp == roots_exp) & (capture_groups_exp >= 0)
+        capture_stone_mask = group_matches.any(dim=2)                               # (B,N2,N2)
 
-        # # For captured neighbour roots, attach their sizes per direction
-        # capture_sizes = torch.zeros_like(capture_groups)
-        # valid_cap     = capture_groups >= 0
-        # cap_flat      = capture_groups.view(B, -1)
-        # valid_flat    = valid_cap.view(B, -1)
-
-        # sizes_flat    = sizes.gather(1, cap_flat.clamp(min=0))
-        # capture_sizes.view(B, -1)[valid_flat] = sizes_flat[valid_flat]
-
-        # Create a direct capture stone mask that shows exactly which stones would be captured
-        # This automatically excludes empty positions and the placed stone itself
-        
-        # Step 1: Expand capture_groups to compare against all roots
-        capture_groups_exp = capture_groups.view(B, N2, 4, 1)  # (B, N2, 4, 1)
-        roots_exp = roots.view(B, 1, 1, N2)  # (B, 1, 1, N2)
-        
-        # Step 2: Find which stones belong to captured groups
-        # Only matches where capture_groups >= 0 (valid groups) and roots match
-        group_matches = (capture_groups_exp == roots_exp) & (capture_groups_exp >= 0)
-        
-        # Step 3: Aggregate across directions (any direction capturing counts)
-        capture_stone_mask = group_matches.any(dim=2)  # (B, N2, N2)
-        
-        # Step 4: Apply opponent-only filter
-        # Only opponent stones can be captured (colour != current_player and != empty)
-        opp_colour = 1 - current_player.view(B, 1)  # (B, 1)
-        is_opponent_stone = (colour == opp_colour)  # (B, N2)
-        
-        # Broadcast to apply opponent filter
+        # Keep opponent stones only
+        opp_colour         = 1 - current_player.view(B, 1)
+        is_opponent_stone  = (self.board_flatten == opp_colour)                      # (B,N2)
         capture_stone_mask = capture_stone_mask & is_opponent_stone.view(B, 1, N2)
-        
-        # Step 5: Ensure diagonal is False (stone can't capture itself - belt and braces)
-        diag_indices = torch.arange(N2, device=self.device)
-        capture_stone_mask[:, diag_indices, diag_indices] = False
 
-        capture_info: Dict[str, torch.Tensor] = {
-            # "would_capture" : (legal_flat & can_capture_any).view(B, H, W),
-            # "capture_sizes" : capture_sizes.view(B, H, W, 4),   # Keep for compatibility
-            "roots"         : roots,     # (B,N2)
-            # "colour"        : colour,    # (B,N2)
-            "capture_stone_mask": capture_stone_mask,  # (B,N2,N2) - exact stones to capture
+        # Belt-and-braces: cannot "capture" the just-placed stone itself here
+        diag = torch.arange(N2, device=self.device)
+        capture_stone_mask[:, diag, diag] = False
+
+        info: Dict[str, torch.Tensor] = {
+            "roots": roots,                          # (B,N2) int64
+            "root_libs": root_libs,                 # (B,N2) int64
+            "can_capture_any": can_capture_any,     # (B,N2) bool
+            "capture_stone_mask": capture_stone_mask,  # (B,N2,N2) bool
         }
-        return legal_mask, capture_info
+        return legal_mask, info
 
     # ------------------------------------------------------------------
-    # Neighbour helpers (batched, flat graph)
+    # Union-find + liberties (flat graph; row-safe compression)
     # ------------------------------------------------------------------
-    def _get_neighbor_colors_batch(self, colour: torch.Tensor) -> torch.Tensor:
-        B, N2 = colour.shape
-        idx   = self.NEIGH_IDX.view(1, N2, 4).expand(B, -1, -1)            # (B,N2,4)
-        valid = self.NEIGH_VALID.view(1, N2, 4).expand(B, -1, -1)          # (B,N2,4)
+    def _batch_init_union_find(
+        self
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns
+        -------
+        roots     : (B,N2) int64  union-find representative per point
+        root_libs : (B,N2) int64  liberty count per root id (index by root id)
+        """
+        board_flatten=self.board_flatten
+        B, N2 = self.board_flatten.shape
+        dev   = self.device
 
-        idx_flat   = idx.reshape(B, -1)
-        valid_flat = valid.reshape(B, -1)
+        # Neighbour colors (computed from board_flatten directly)
+        neigh_valid_flatten_b = self.neigh_valid_flatten.view(1, N2, 4).expand(B, -1, -1)
+        neigh_cols            = self._get_neighbor_colors_batch()  # (B,N2,4)
 
-        out = torch.full_like(idx_flat, SENTINEL_NEIGH_COLOR, dtype=DTYPE_COLOR)
-        gathered = torch.gather(colour, 1, idx_flat.clamp(min=0))
-        out[valid_flat] = gathered[valid_flat]
-        return out.view(B, N2, 4)
+        # Same-color adjacency (ignore empties; respect edges)
+        same = (neigh_cols == board_flatten.unsqueeze(2)) \
+             & (board_flatten.unsqueeze(2) != -1) \
+             & neigh_valid_flatten_b                                              # (B,N2,4)
 
-    def _get_neighbor_roots_batch(self, roots: torch.Tensor) -> torch.Tensor:
-        B, N2 = roots.shape
-        idx   = self.NEIGH_IDX.view(1, N2, 4).expand(B, -1, -1)            # (B,N2,4)
-        valid = self.NEIGH_VALID.view(1, N2, 4).expand(B, -1, -1)          # (B,N2,4)
+        # Hook & compress
+        parent = torch.arange(N2, dtype=IDX_DTYPE, device=dev).expand(B, N2)      # (B,N2)
+        parent = self._hook_and_compress(parent, same)
+        roots  = parent                                                           # (B,N2)
 
-        idx_flat   = idx.reshape(B, -1)
-        valid_flat = valid.reshape(B, -1)
+        # Count unique liberties per root
+        is_lib     = (neigh_cols == -1) & neigh_valid_flatten_b                   # (B,N2,4)
+        stone_mask = (board_flatten != -1)                                        # (B,N2)
 
-        out = torch.full_like(idx_flat, SENTINEL_NEIGH_ROOT, dtype=IDX_DTYPE)
-        gathered = torch.gather(roots, 1, idx_flat.clamp(min=0))
-        out[valid_flat] = gathered[valid_flat]
-        return out.view(B, N2, 4)
+        libs_per_root = torch.zeros(B * N2, dtype=IDX_DTYPE, device=dev)          # (B*N2,)
+
+        batch_map = torch.arange(B, dtype=IDX_DTYPE, device=dev).view(B, 1, 1)
+        roots_exp = roots.unsqueeze(2)                                            # (B,N2,1)
+        lib_idx   = self.neigh_index_flatten.view(1, N2, 4)                       # (1,N2,4)
+        mask      = is_lib & stone_mask.unsqueeze(2)                               # (B,N2,4)
+
+        #Here K is the number of stone→empty edges across the batch.
+        #edges → (r,l), (r,l)
+        fb = batch_map.expand_as(mask)[mask]                                       # (K,)
+        fr = roots_exp.expand_as(mask)[mask]                                       # (K,)
+        fl = lib_idx.expand_as(mask)[mask]                                         # (K,)
+
+        # Deduplicate by (batch, root, liberty_point)
+        key_root = fb * N2 + fr
+        key_lib  = fb * N2 + fl
+        pairs    = torch.stack((key_root, key_lib), dim=1)                         # (K,2)
+
+        sort_key     = pairs[:, 0] * (N2 * B) + pairs[:, 1]
+        sorted_idx   = sort_key.argsort()
+        pairs_sorted = pairs[sorted_idx]
+        uniq         = torch.unique_consecutive(pairs_sorted, dim=0)
+
+        libs_per_root.scatter_add_(0, uniq[:, 0], torch.ones_like(uniq[:, 0], dtype=IDX_DTYPE))
+        root_libs = libs_per_root.reshape(B, N2)                                   # (B,N2)
+
+        return roots, root_libs
 
     # ------------------------------------------------------------------
-    # _hook_and_compress
+    # Batched pointer-jumping with periodic convergence check
     # ------------------------------------------------------------------
-
     def _hook_and_compress(self, parent: torch.Tensor, same: torch.Tensor) -> torch.Tensor:
         B, N2 = parent.shape
-        nbr_idx  = self.NEIGH_IDX.view(1, N2, 4).expand(B, -1, -1)
-        max_rounds = int((N2).bit_length())+6
+        neigh_index_flatten_b = self.neigh_index_flatten.view(1, N2, 4).expand(B, -1, -1)
+        max_rounds = N2
 
         for i in range(max_rounds):
             parent_prev = parent
-            nbr_parent = torch.gather(parent, 1, nbr_idx.clamp(min=0).reshape(B, -1)).view(B, N2, 4)
-            nbr_parent = torch.where(same, nbr_parent, torch.full_like(nbr_parent, N2))
-            min_nbr_parent = nbr_parent.min(dim=2).values
-            hooked = torch.minimum(parent, min_nbr_parent)
-            comp   = torch.gather(hooked, 1, hooked)
-            comp2  = torch.gather(comp,   1, comp)
-            
-            # <-- add convergence check
-            if (i & 3) == 3:  # every 4th iter
-                if torch.equal(comp2, parent_prev):
-                    return comp2
-            parent = comp2
+            nbr_parent  = torch.gather(parent, 1, neigh_index_flatten_b.clamp(min=0).reshape(B, -1)).view(B, N2, 4) # (B,N2,4)
+            nbr_parent  = torch.where(same, nbr_parent, torch.full_like(nbr_parent, N2)) # (B,N2,4)
+            min_nbr     = nbr_parent.min(dim=2).values                                   # (B,N2)
+
+            hooked = torch.minimum(parent, min_nbr)                                      # (B,N2)
+            comp   = torch.gather(hooked, 1, hooked)                                     # parent[parent]
+            comp   = torch.gather(comp,   1, comp)                                       # parent[parent[parent]]
+            # lazy convergence check
+            if (i & 3) == 3 and torch.equal(comp, parent_prev):                          # early exit every 4 iters
+                return comp
+            parent = comp
         return parent
-    
+
     # ------------------------------------------------------------------
-    # Union‑find + liberties (flat graph; **row‑safe** compression)
+    # Neighbour helpers (batched, flat graph, 4 dirs)
     # ------------------------------------------------------------------
-    def _batch_init_union_find(
+    def _get_neighbor_colors_batch(
         self,
-        board_f: torch.Tensor  # (B, N2) int8 in {-1,0,1}
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, N2 = board_f.shape
-        dev = self.device
+    ) -> torch.Tensor:
+        """Return neighbor colors(stones) pulled from self.board_flatten."""
+        B, N2 = self.board_flatten.shape
+        # Broadcast per-board tables to batch (views; no copies)
+        neigh_index_f_b   = self.neigh_index_flatten.view(1, N2, 4).expand(B, -1, -1).clamp(min=0)  # (B,N2,4)
+        neigh_valid_f_b = self.neigh_valid_flatten.view(1, N2, 4).expand(B, -1, -1)               # (B,N2,4) bool
+        
+        # 2) Make a 3 Dimensioanl view of the board so ranks match index (no copy)
+        board3 = self.board_flatten.unsqueeze(2).expand(-1, -1, 4)                   # (B, N2, 4)
+        
+        # Gather neighbor colors along the N2 dimension
+        gathered = torch.gather(board3, dim=1, index=neigh_index_f_b)                                 # (B,N2,4)
 
-        # Colours in fixed dtype (no changes to values)
-        colour = board_f.to(DTYPE_COLOR)                                    # (B,N2)
-                             # (B,N2)
+        out = torch.where(neigh_valid_f_b, gathered.to(DTYPE_COLOR),
+                      torch.full_like(gathered, SENTINEL_NEIGH_COLOR, dtype=DTYPE_COLOR))
+        return out  # (B,N2,4)
 
-        # Same-colour adjacency mask (compute once)
-        neigh_cols = self._get_neighbor_colors_batch(colour)                # (B,N2,4)
-        same = (neigh_cols == colour.unsqueeze(2)) \
-               & (colour.unsqueeze(2) != -1) \
-               & self.NEIGH_VALID.view(1, N2, 4)                            # (B,N2,4)
+    def _get_neighbor_roots_batch(
+        self,
+        roots: torch.Tensor,                         # (B,N2)
+    ) -> torch.Tensor:
+        B, N2 = roots.shape
+        # Broadcast per-board tables to batch (views; no copies)
+        neigh_index_f_b   = self.neigh_index_flatten.view(1, N2, 4).expand(B, -1, -1).clamp(min=0)  # (B,N2,4)
+        neigh_valid_f_b = self.neigh_valid_flatten.view(1, N2, 4).expand(B, -1, -1)               # (B,N2,4) bool
+        
+        roots3  = roots.unsqueeze(2).expand(-1, -1, 4)                                      # (B,N2,4)
+        gathered = torch.gather(roots3, dim=1, index=neigh_index_f_b)                                 # (B,N2,4)
+        
+        out = torch.where(neigh_valid_f_b, gathered,
+                      torch.full_like(gathered, SENTINEL_NEIGH_ROOT, dtype=IDX_DTYPE))
 
-        # Initialize parents once, then compress
-        parent = torch.arange(N2, dtype=IDX_DTYPE, device=dev).expand(B, N2)
-        parent = self._hook_and_compress(parent, same)
-        roots = parent                                                       # (B,N2)
-
-        # ---- Count unique liberties per root ----
-        neigh_cols2 = neigh_cols              # (B,N2,4)
-        is_lib      = (neigh_cols2 == -1) & self.NEIGH_VALID.view(1, N2, 4) # (B,N2,4)
-        stone_mask  = (colour != -1)                                        # (B,N2)
-
-        libs_per_root = torch.zeros(B * N2, dtype=IDX_DTYPE, device=dev)    # (B*N2,)
-
-
-        batch_map = torch.arange(B, dtype=IDX_DTYPE, device=dev).view(B, 1, 1)
-        roots_exp = roots.unsqueeze(2)                                  # (B,N2,1)
-        lib_idx   = self.NEIGH_IDX.view(1, N2, 4)                       # (1,N2,4)
-        mask      = is_lib & stone_mask.unsqueeze(2)                    # (B,N2,4)
-
-        fb = batch_map.expand_as(mask)[mask]                            # (K,)
-        fr = roots_exp.expand_as(mask)[mask]                            # (K,)
-        fl = lib_idx.expand_as(mask)[mask]                              # (K,)
-
-        key_root = fb * N2 + fr
-        key_lib  = fb * N2 + fl
-        pairs    = torch.stack((key_root, key_lib), dim=1)              # (K,2)
-
-            # Deduplicate by (root, liberty point)
-            # Sort by both columns to ensure identical pairs are consecutive
-            # First create a single sort key: root * (N2*B) + lib
-        sort_key = pairs[:, 0] * (N2 * B) + pairs[:, 1]
-        sorted_idx = sort_key.argsort()
-        pairs_sorted = pairs[sorted_idx]
-        uniq  = torch.unique_consecutive(pairs_sorted, dim=0)
-            # On cuda, we can directly use unique
-            # uniq  = torch.unique(pairs, dim=0)
-
-        libs_per_root.scatter_add_(0, uniq[:, 0],
-                                       torch.ones_like(uniq[:, 0], dtype=IDX_DTYPE))
-
-        root_libs = libs_per_root.reshape(B, N2)                            # (B,N2)
-        return parent, colour, roots, root_libs
+        return out  # (B,N2,4)

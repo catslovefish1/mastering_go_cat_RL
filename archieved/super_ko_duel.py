@@ -2,7 +2,7 @@
 
 import time
 import torch
-from engine.tensor_native import TensorBoard
+from engine.tensor_native_stable import TensorBoard
 from agents.basic import TensorBatchBot
 
 

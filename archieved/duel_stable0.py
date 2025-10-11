@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any
 import torch
 from torch import Tensor
 
-from engine.tensor_native import TensorBoard
+from engine.tensor_native_stable import TensorBoard
 from agents.basic import TensorBatchBot
 from interface.ascii import show
 
