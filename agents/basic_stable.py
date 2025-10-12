@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 # Import TensorBoard and select_device from engine
-from engine.tensor_native import TensorBoard, select_device
+from engine.tensor_native_stable import TensorBoard, select_device
 
 # Type aliases for clarity
 BatchSize = int

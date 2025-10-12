@@ -125,7 +125,7 @@ def test_random_agent_behavior():
     print("RANDOM AGENT BEHAVIOR TEST")
     print("="*80)
     
-    from engine.tensor_native import TensorBoard
+    from engine.tensor_native_stable import TensorBoard
     from agents.basic import TensorBatchBot
     
     board_size = 5

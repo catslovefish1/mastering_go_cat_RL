@@ -16,7 +16,7 @@ import torch
 from torch import Tensor
 
 # Import engine and utilities
-from engine.tensor_native import TensorBoard
+from engine.tensor_native_stable import TensorBoard
 from utils.shared import (
     select_device,
     flat_to_2d,

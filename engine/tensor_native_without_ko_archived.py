@@ -199,6 +199,7 @@ class TensorBoard(torch.nn.Module):
         # ------------------------------------------------------------------ #
         roots = self._last_capture_info["roots"]           # (B, N²)
         cap_groups = self._last_capture_info["capture_groups"]  # (B,H,W,4)
+        
         cap_sizes = self._last_capture_info["capture_sizes"]    # (B,H,W,4)
         total_caps = self._last_capture_info["total_captures"]  # (B,H,W)
         

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 # Adjust these imports to match your actual filenames:
 from engine.GoLegalMoveChecker import GoLegalMoveChecker
-from engine.tensor_native import TensorBoard, Stone   # change module name if needed
+from engine.tensor_native_stable import TensorBoard, Stone   # change module name if needed
 
 def xor_reduce_last_dim(x: torch.Tensor) -> torch.Tensor:
     while x.size(-1) > 1:

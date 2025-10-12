@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 # Import engine
-from engine.tensor_native import TensorBoard
+from engine.tensor_native_stable import TensorBoard
 
 # Import simple MCTS implementation
 from NN.simple_mcts import SimpleMCTS
