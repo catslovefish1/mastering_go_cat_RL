@@ -1,5 +1,5 @@
-# board_tensor.py – GPU-optimized Go engine (delta-hash super-ko, CSR captures)
-# Uses CSR (cap_indptr/cap_indices) both for super-ko AND for in-place removals.
+# board_tensor.py – GPU-optimized Go engine (delta-hash super-ko, no board clones)
+# with DEBUG trace hooks for placement/removal (no logic changes)
 
 from __future__ import annotations
 import os
@@ -56,11 +56,11 @@ class TensorBoard(torch.nn.Module):
         self,
         batch_size: int = 1,
         board_size: int = 19,
-        history_factor: int = 1,
+        history_factor: int = 10,
         device: Optional[torch.device] = None,
         enable_timing: bool = True,
         enable_super_ko: bool = True,
-        debug_place_trace: bool = False,
+        debug_place_trace: bool = False,  # <<< DEBUG flag
     ) -> None:
         super().__init__()
         self.batch_size     = batch_size
@@ -69,7 +69,7 @@ class TensorBoard(torch.nn.Module):
         self.device         = device or select_device()
         self.enable_timing  = enable_timing
         self.enable_super_ko = enable_super_ko
-        self.debug_place_trace = debug_place_trace
+        self.debug_place_trace = debug_place_trace  # <<< store flag
 
         # Timing infrastructure
         if enable_timing:
@@ -79,7 +79,7 @@ class TensorBoard(torch.nn.Module):
             self.timings = {}
             self.call_counts = {}
 
-        # Core legal move checker (emits CSR + legacy dense for migration)
+        # Core legal move checker
         self.legal_checker = GoLegalMoveChecker(
             board_size=board_size,
             device=self.device
@@ -97,6 +97,7 @@ class TensorBoard(torch.nn.Module):
     # Static data                                                        #
     # ------------------------------------------------------------------ #
     def _init_constants(self) -> None:
+        # Pre-compute as tensor for efficiency (kept for potential use)
         self.NEIGHBOR_OFFSETS = torch.tensor(
             [-self.board_size,   # N
               self.board_size,   # S
@@ -124,9 +125,11 @@ class TensorBoard(torch.nn.Module):
         )
 
         # Linear helpers
+        # POS_2D[r,c] -> linear index in [0, N2)
         self.POS_2D = torch.arange(self.N2, device=self.device, dtype=torch.int64).view(H, W)
-        self.Zpos = self.zobrist_table.view(self.N2, 3).contiguous()      # (N2,3)
-        self.ZposT = self.Zpos.transpose(0, 1).contiguous()               # (3,N2)
+        # Flattened Zobrist: (N2, 3)
+        self.Zpos = self.zobrist_table.view(self.N2, 3).contiguous()
+        self.ZposT = self.Zpos.transpose(0, 1).contiguous()   # <-- cache once
 
     # ------------------------------------------------------------------ #
     # Mutable state                                                      #
@@ -166,10 +169,13 @@ class TensorBoard(torch.nn.Module):
 
         # Super-ko tracking with Zobrist hashing
         if self.enable_super_ko:
+            # Current hash for each game
             self.register_buffer(
                 "current_hash",
                 torch.zeros(B, dtype=torch.int32, device=dev)
             )
+
+            # History of hashes for super-ko detection
             self.register_buffer(
                 "hash_history",
                 torch.zeros((B, max_moves), dtype=torch.int32, device=dev)
@@ -187,6 +193,9 @@ class TensorBoard(torch.nn.Module):
         self._last_legal_mask   = None
         self._last_info = None
 
+
+    
+
     # ==================== LEGAL MOVES ======================================= #
 
     @timed_method
@@ -195,13 +204,21 @@ class TensorBoard(torch.nn.Module):
         Compute legal moves (and capture info) and apply super-ko filtering.
         """
         if self._last_legal_mask is None:
-            legal_mask, info = self._compute_legal_core()
+                                                      
+            legal_mask, info  = self._compute_legal_core()
+            
+
+
             if self.enable_super_ko:
                 legal_mask = self._filter_super_ko_vectorized(legal_mask, info)
-            self._last_legal_mask = legal_mask
-            self._last_info = info
-        return self._last_legal_mask
 
+            self._last_legal_mask   = legal_mask
+
+            self._last_info = info
+            
+        return self._last_legal_mask
+    
+    
     @timed_method
     def _compute_legal_core(self):
         """
@@ -212,218 +229,235 @@ class TensorBoard(torch.nn.Module):
             board=self.board,
             current_player=self.current_player,
             return_info=True,
-        )
-        
-    # ======= Super-ko via delta-hash (CSR captures, no clones, no .item() syncs) =======
-    @timed_method
+    )
+
+    # ======= Super-ko via delta-hash (no board clones, no .item() syncs) =======
+    # no branching but extremely large size as B*N2*N2 int32 tensor
+    # @timed_method
     def _filter_super_ko_vectorized(self, legal_mask: BoardTensor, info: Dict) -> BoardTensor:
         """
-        Use Zobrist deltas + CSR capture lists to remove super-ko repeats.
-        CSR inputs (flat row-space):
-          cap_indptr:  (B*N2 + 1,) int32
-          cap_indices: (L,)        int32
-        Row id: r = b*N2 + i
-        """
+        Super-ko pre-filter using delta Zobrist hashes.
+
+        For every *candidate* point (i.e., legal move), we:
+          1) compute the Zobrist delta for placing a stone there,
+          2) compute the Zobrist delta for removing any captured opponent stones,
+          3) XOR both deltas with the current hash to get the post-move hash,
+          4) reject the move if this post-move hash appears in hash_history.
+
+        Shapes
+        ------
+        legal_mask : (B, H, W) bool
+        capture_stone_mask : (B, N2, N2) bool  # per-move: which stones would be captured
+        """ 
         B, H, W = legal_mask.shape
         N2 = H * W
-        dev = self.device
 
         # --- Candidate mask (flattened) -----------------------------------------
-        legal_flat: Tensor = legal_mask.view(B, N2).bool()          # (B, N2)
-        cand_mask: Tensor  = legal_flat                              # (B, N2)
+        legal_flat : Tensor = legal_mask.view(B, N2)                     # (B,N2)
+        cand_mask  : Tensor = legal_flat.bool()           # (B, N2)
 
-        # --- Player / opponent lanes --------------------------------------------
-        player = self.current_player.long()                          # (B,)
-        opp    = 1 - player
+        # --- Player / opponent lane indices -------------------------------------
+        # Zpos state columns: 0=empty, 1=black, 2=white
+        player = self.current_player.long()                        # (B,)
+        opp    = 1 - player                    
+        
+        # --- Placement delta: EMPTY -> player -------------------------------------
+        # Zpos is (N2,3) int32, index with (B,N2) row ids and (B,N2) col ids.
+        Zpos: Tensor = self.Zpos                                   # (N2, 3) int32
+        lin = torch.arange(N2, device=self.device).view(1, -1).expand(B, -1)   # (B,N2)
+        empty_col  = torch.zeros_like(player)[:, None]                                # (B,1)
+        player_col = (player + 1)[:, None]                                            # (B,1)
+        place_old  = Zpos[lin, empty_col]                                # (B, N2) int32
+        place_new  = Zpos[lin, player_col]                               # (B, N2) int32
+        place_delta = torch.bitwise_xor(place_old, place_new)            # (B, N2) int32# (B,)
 
-        # --- Placement delta: EMPTY -> player -----------------------------------
-        Zpos: Tensor = self.Zpos                                     # (N2, 3) int32
-        lin = torch.arange(N2, device=dev).view(1, -1).expand(B, -1) # (B, N2)
-        empty_col  = torch.zeros_like(player)[:, None]               # (B, 1)
-        player_col = (player + 1)[:, None]                           # (B, 1)
-        place_old  = Zpos[lin, empty_col]                            # (B, N2) int32
-        place_new  = Zpos[lin, player_col]                           # (B, N2) int32
-        place_delta = torch.bitwise_xor(place_old, place_new)        # (B, N2) int32
-
-        # Per-cell toggle for opponent→empty (used for captured stones)
-        Z_emp: Tensor = self.ZposT[0].expand(B, -1)                  # (B, N2) int32
-        Z_opp: Tensor = self.ZposT[(opp + 1)]                        # (B, N2) int32
-        D: Tensor     = torch.bitwise_xor(Z_opp, Z_emp)              # (B, N2) int32
-
-        # Start with placement only
+        
+        Z_emp: Tensor = self.ZposT[0].expand(B, -1)          # (B, N2) int32
+        Z_opp: Tensor = self.ZposT[(opp + 1)]                # (B, N2) int32
+        D: Tensor     = torch.bitwise_xor(Z_opp, Z_emp)      # (B, N2) int32
+        
         new_hash = (self.current_hash[:, None] ^ place_delta).contiguous()  # (B, N2) int32
+        
 
-        # --- Capture handling via CSR -------------------------------------------
-        cap_indptr  = info["cap_indptr"].reshape(-1).to(torch.int64)   # (B*N2 + 1,)
-        cap_indices = info["cap_indices"].reshape(-1).to(torch.int64)  # (L,)
-        cand_cap = (legal_flat & info["can_capture_any"]).reshape(-1)  # (B*N2,)
+        # --- Capture mask from the legal checker (opponent only, diagonal excluded) ---
+        
+        cap_mask = info["capture_stone_mask"]  # (B,N2,N2)  
+        cand_cap   = legal_flat & info["can_capture_any"]   # (B, N2) bool. candidates that can capture at least one stone
+        
+        # Triples of (b, i, j) for captured stones of capturing candidates
+        cap_mask = info["capture_stone_mask"]            # (B, N2, N2) bool
+        b_idx, i_idx, j_idx = (cap_mask & cand_cap.unsqueeze(-1)).nonzero(as_tuple=True)  # each is (K,)
+        
+        key = b_idx * N2 + i_idx                                   # (K,)
+        # Sort once by key
+        key_s, perm = torch.sort(key)
+        b_s, i_s, j_s = b_idx[perm], i_idx[perm], j_idx[perm]
+        
+        # Segment boundaries per unique (b,i)
+        uniq, counts = torch.unique_consecutive(key_s, return_counts=True)
+        ends   = torch.cumsum(counts, dim=0)                                 # (G,)
+        starts = torch.zeros_like(ends)
+        starts[1:] = ends[:-1]                                               # (G,)
+        
 
-        starts = cap_indptr[:-1]                                       # (B*N2,)
-        lens   = (cap_indptr[1:] - cap_indptr[:-1])                    # (B*N2,)
-        keep   = cand_cap & (lens > 0)                                 # (B*N2,)
-
-        if keep.any():
-            seg_ids = keep.nonzero(as_tuple=True)[0]                   # (T,)
-            b_seg = (seg_ids // N2).to(torch.int64)                    # (T,)
-            i_seg = (seg_ids %  N2).to(torch.int64)                    # (T,)
-            s_seg = starts[seg_ids]                                    # (T,)
-            n_seg = lens[seg_ids]                                      # (T,) int64
-
-            # Pad to the max segment length so we can do one dense gather + XOR reduce
-            Lmax = int(n_seg.max().item())                             # small host read
-            offs = torch.arange(Lmax, device=dev, dtype=torch.int64)   # (Lmax,)
-            idx  = s_seg[:, None] + offs[None, :]                      # (T, Lmax)
-            mask = offs[None, :] < n_seg[:, None]                      # (T, Lmax)
-
-            # Captured stone indices per (b,i), padded
-            jmat = torch.where(mask, cap_indices[idx], torch.zeros_like(idx))      # (T, Lmax)
-
-            # Zobrist toggles for those stones and XOR-reduce across width
-            vals = D[b_seg].gather(1, jmat)                                        # (T, Lmax)
-            vals = torch.where(mask, vals, vals.new_zeros((), dtype=vals.dtype))   # zero pads
-
-            # Tree XOR reduce along last dim
-            acc = vals
+        # Decode (b_g, i_g) for each unique candidate group
+        b_g = uniq // N2                                                     # (G,)
+        i_g = uniq %  N2 
+        
+        K = key_s.numel()
+        G = uniq.numel()# (G,)
+        
+        if G == 0:
+        # no capturing candidates, nothing to add
+            pass
+        else:
+                # For each sorted triple entry, map it to its group id and its position within that group
+            row_ids = torch.repeat_interleave(torch.arange(G, device=self.device, dtype=torch.int64),
+                                      counts)                                 # (K,)
+            pos_in_group = torch.arange(K, device=self.device, dtype=torch.int64) - \
+                   torch.repeat_interleave(starts, counts)                    # (K,)
+                   
+             # Values to XOR: D[b, j] for each triple
+            vals = D[b_s, j_s]                                                        # (K,) int32
+            
+            # Padded [G, Lmax] buffer and XOR reduce across dim=1
+            Lmax = counts.max()
+            pad = vals.new_zeros((G, Lmax), dtype=vals.dtype)                          # int32
+            pad[row_ids, pos_in_group] = vals
+            
+            # Tree XOR along dim=1 (no Python loops over groups)
+            cap_delta = pad                                                           # (G, Lmax)
             width = Lmax
             while width > 1:
                 half = width // 2
-                acc = torch.bitwise_xor(acc[:, :half], acc[:, half:half*2])
+                cap_delta = torch.bitwise_xor(cap_delta[:, :half], cap_delta[:, half:half*2])
                 if width & 1:
-                    acc = torch.bitwise_xor(acc, acc[:, -1:])
-                width = acc.size(1)
-            cap_delta = acc.squeeze(1)                                             # (T,)
+                    cap_delta = torch.bitwise_xor(cap_delta, cap_delta[:, -1:])
+                width = cap_delta.size(1)
+            cap_delta = cap_delta.squeeze(1)                                          # (G,) int32
+        
 
-            # Blend captured-stone delta into the post-move hash for those rows
-            new_hash[b_seg, i_seg] ^= cap_delta
+            # Blend the capture delta into new_hash for this candidate
+            new_hash[b_g, i_g] ^= cap_delta    
 
-        # ---- Compare against history in chunks ---------------------------------
+
+        # ---- Compare against history in chunks (branch-free with masks) ----------
         M = self.hash_history.shape[1]
-        hist_mask = (torch.arange(M, device=dev)[None, :] < self.move_count[:, None])  # (B, M) bool
+        HIST = self.hash_history                                           # (B,M) int32
+        hist_mask = (torch.arange(M, device=self.device)[None, :] < self.move_count[:, None])  # (B,M) bool
 
-        is_repeat_flat = torch.zeros(B, N2, dtype=torch.bool, device=dev)
-        HIST_CHUNK = 32
+        is_repeat_flat = torch.zeros(B, N2, dtype=torch.bool, device=self.device)
+
+        HIST_CHUNK = 256  # tune: memory/perf tradeoff
         for s in range(0, M, HIST_CHUNK):
             e = min(s + HIST_CHUNK, M)
-            h = self.hash_history[:, s:e]                           # (B, m)
-            m = hist_mask[:, s:e]                                   # (B, m) bool
-            eq = (new_hash[:, :, None] == h[:, None, :])            # (B, N2, m)
-            eq &= m[:, None, :]                                     # mask invalid columns
-            is_repeat_flat |= eq.any(dim=2)
+            h = HIST[:, s:e]                         # (B,m)
+            m = hist_mask[:, s:e]                    # (B,m) bool
+            eq = (new_hash[:, :, None] == h[:, None, :])  # (B,N2,m) bool
+            eq &= m[:, None, :]                      # mask invalid columns
+            is_repeat_flat |= eq.any(dim=2)          # reduce over history slice
 
         # Keep only legal candidates that are not repeats
-        is_repeat_flat &= legal_flat
-        repeat_mask = is_repeat_flat.view(B, H, W)
+        is_repeat_flat &= cand_mask
+        repeat_mask = is_repeat_flat.view(B, H, W)    
+  
         return legal_mask & ~repeat_mask
 
+
     # ==================== MOVE EXECUTION ==================================== #
-    @timed_method
+
     def _update_hash_incremental(
         self, 
         b_idx: Tensor,       # (M,)  rows that actually played this ply
         rows: Tensor,        # (M,)  row indices (0..H-1) for the stone
         cols: Tensor,        # (M,)  col indices (0..W-1) for the stone
         ply: Tensor,         # (M,)  player color (0=black, 1=white)
-        cap_mask_2d: Tensor  # (M, H, W) mask of stones captured by each played move
+        cap_mask_2d: Tensor  #  (M, H, W) mask of stones captured by each played move
     ) -> None: 
         """
         Incrementally update current_hash for rows in b_idx:
         XOR in the placed stone and XOR out captured opponent stones.
         """
+
+
         M = b_idx.numel()
         H = W = self.board_size
         N2 = H * W
 
-        played_lin = self.POS_2D[rows, cols]                   # (M,)
+        played_lin = self.POS_2D[rows, cols]                   # (M,)  linearized positions of played moves
         opp = (1 - ply).long()                                 # (M,)
 
-        # Placement delta at the played point: EMPTY -> ply
-        Zpos: Tensor = self.Zpos                # (N2, 3)
-        old_key = Zpos[played_lin, torch.zeros_like(ply)]
-        new_key = Zpos[played_lin, (ply + 1)]
-        place_delta = torch.bitwise_xor(old_key, new_key)
+        # --- Placement delta at the played point: EMPTY -> ply -------------------
+        Zpos: Tensor = self.Zpos                # (N2, 3)  0=empty,1=black,2=white
+        old_key = Zpos[played_lin, torch.zeros_like(ply)]   # (M,)  empty keys
+        new_key = Zpos[played_lin, (ply + 1)]               # (M,)  player keys,+1 here means a shift from (-1,0,1) to (0,1,2)
+        place_delta = torch.bitwise_xor(old_key, new_key)   # (M,)
+        
+         # --- Capture delta over all stones removed by this move ------------------
+        cap_flat    = cap_mask_2d.view(M, N2)   # (M, N2)
 
-        # Capture delta over all stones removed by this move
-        cap_flat    = cap_mask_2d.view(M, N2)
 
         Z_emp_rows = self.ZposT[0].expand(M, -1)
         Z_opp_rows = self.ZposT[(opp + 1)]
+        
 
+        
         sel_opp = torch.where(cap_flat, Z_opp_rows, torch.zeros_like(Z_opp_rows))  # (M, N2)
         sel_emp = torch.where(cap_flat, Z_emp_rows, torch.zeros_like(Z_emp_rows))  # (M, N2)
         
-        def xor_reduce_rowwise(x):
-            M_, K_ = x.shape
-            P = 1 << (K_ - 1).bit_length()
-            if P != K_:
-                x = torch.cat([x, x.new_zeros(M_, P - K_)], dim=1)
-                K_ = P
-            steps = K_.bit_length() - 1
+        def xor_reduce_rowwise(x):      # x: (M, K)
+            M, K = x.shape
+            P = 1 << (K - 1).bit_length()           # next power of two ≥ K
+            if P != K:
+                x = torch.cat([x, x.new_zeros(M, P - K)], dim=1)  # pad with zeros
+                K = P
+            steps = K.bit_length() - 1
             for _ in range(steps):
-                half = K_ // 2
-                x = torch.bitwise_xor(x[:, :half], x[:, half:half*2])
-                if K_ & 1:
-                    x = torch.bitwise_xor(x, x[:, -1:])
-                K_ = x.size(1)
-            return x.squeeze(1)
+                half = K // 2
+                x = torch.bitwise_xor(x[:, :half], x[:, half:K])  # pairwise XOR
+                K = half
+            return x.squeeze(1)                                   # (M,)
         
-        cap_delta_opp = xor_reduce_rowwise(sel_opp)
-        cap_delta_emp = xor_reduce_rowwise(sel_emp)
+        cap_delta_opp = xor_reduce_rowwise(sel_opp)      # (M,)
+        cap_delta_emp = xor_reduce_rowwise(sel_emp)      # (M,)
         cap_delta     = torch.bitwise_xor(cap_delta_opp, cap_delta_emp)
 
         self.current_hash[b_idx] ^= (place_delta ^ cap_delta)
 
     @timed_method
     def _place_stones(self, positions: PositionTensor) -> None:
-        """Vectorized stone placement, capture handling, and incremental hash update (CSR)."""
-        dev = self.device
+        """Vectorized stone placement, capture handling, and incremental hash update."""
         H = W = self.board_size
-        N2 = H * W
+
+
 
         # Masked indexing works even with empty selections (no need to branch)
         mask_play = (positions[:, 0] >= 0) & (positions[:, 1] >= 0)   # (B,)
         b_idx = mask_play.nonzero(as_tuple=True)[0]                   # (M,)
         rows = positions[b_idx, 0].long()
         cols = positions[b_idx, 1].long()
-        ply  = self.current_player[b_idx].long()                      # (M,)
+        ply  = self.current_player[b_idx].long()               # (M,)
         M    = b_idx.numel()
 
-        # ---- Build capture mask for the played moves from CSR (branch-free) ----
-        # CSR (flat row-space) from last legal computation
-        cap_indptr  = self._last_info["cap_indptr"].reshape(-1).to(torch.int64)  # (B*N2+1,)
-        cap_indices = self._last_info["cap_indices"].reshape(-1).to(torch.int64) # (L,)
+        # Get capture mask from the clean capture_stone_mask (vectorized, no loops)
+        capture_stone_mask = self._last_info["capture_stone_mask"]  # (B,N2,N2),bool
+        linear_idx = rows * W + cols  # Linear indices of played positions (M,)
+        
+        # Extract the capture masks for the specific moves using advanced indexing
+        # capture_stone_mask[b_idx, linear_idx] gives us (M, N2) directly
+        cap_mask = capture_stone_mask[b_idx, linear_idx]  # (M, N2)
+        cap_mask_2d = cap_mask.view(M, H, W)  # (M, H, W)
 
-        # Row id in the flat CSR space is r = b*N2 + i (i is linear move index)
-        i_lin  = (rows * W + cols).to(torch.int64)              # (M,)
-        r_flat = (b_idx.to(torch.int64) * N2 + i_lin)           # (M,)
 
-        starts = cap_indptr[r_flat]                             # (M,)
-        ends   = cap_indptr[r_flat + 1]                         # (M,)
-        lens   = (ends - starts)                                # (M,) int64
-
-        # Pad to Lmax and gather (works for lens==0 too)
-        Lmax = int(lens.max().item())                           # small host read; ok
-        offs = torch.arange(Lmax, device=dev, dtype=torch.int64)              # (Lmax,)
-        idx  = starts[:, None] + offs[None, :]                               # (M, Lmax)
-        mask = offs[None, :] < lens[:, None]                                  # (M, Lmax)
-
-        # Gather captured linear indices, mask out padded cols
-        jmat = torch.where(mask, cap_indices[idx], torch.zeros_like(idx))     # (M, Lmax)
-
-        # Scatter into a (M, H, W) boolean mask without loops
-        cap_mask_flat = torch.zeros(M * N2, dtype=torch.bool, device=dev)     # (M*N2,)
-        base = (torch.arange(M, device=dev, dtype=torch.int64) * N2)[:, None] # (M,1)
-        flat_pos = base + jmat                                                # (M, Lmax)
-        flat_sel = flat_pos[mask]                                             # (K,) possibly 0
-        cap_mask_flat[flat_sel] = True
-        cap_mask_2d = cap_mask_flat.view(M, H, W)
-
-        # ---- Incremental hash update BEFORE mutating the board -----------------
+        # --- Incremental hash update BEFORE mutating the board (unchanged) ---
         if self.enable_super_ko:
             self._update_hash_incremental(b_idx, rows, cols, ply, cap_mask_2d)
 
-        # ---- Apply the move on the board --------------------------------------
+        # --- Place stones and apply removals on the board (UNCHANGED LOGIC) ---
         self.board[b_idx, rows, cols] = ply.to(self.board.dtype)
         self.board[b_idx] = torch.where(cap_mask_2d, Stone.EMPTY, self.board[b_idx])
+
+
 
     # ------------------------------------------------------------------ #
     # History                                                            #
@@ -436,14 +470,17 @@ class TensorBoard(torch.nn.Module):
         B,H,W = self.batch_size, self.board_size, self.board_size
         max_moves = self.board_history.shape[1]
 
+        # Flatten current board state
         flat = self.board.flatten(1)  # (B, H*W)
 
+        # Store in history if not at limit - vectorized operation
         move_idx = self.move_count.long()
         valid_mask = move_idx < max_moves
         
         b_idx = torch.arange(B, device=self.device)[valid_mask]
         mv_idx = move_idx[valid_mask]
         
+        # Safe even if K==0
         self.board_history[b_idx, mv_idx] = flat[valid_mask]
         if self.enable_super_ko:
             self.hash_history[b_idx, mv_idx] = self.current_hash[valid_mask]
@@ -461,6 +498,8 @@ class TensorBoard(torch.nn.Module):
         positions : (B, 2) tensor
             Row, column coordinates. Negative values indicate pass.
         """
+        
+        # Normalize input to the board's device up front (prevents mixed-device indexing)
         positions = positions.to(self.device, non_blocking=True)
 
         if positions.dim() != 2 or positions.size(1) != 2:
@@ -489,11 +528,10 @@ class TensorBoard(torch.nn.Module):
     # ------------------------------------------------------------------ #
     # Game state                                                         #
     # ------------------------------------------------------------------ #
-    @timed_method
     def is_game_over(self) -> PassTensor:
         """Check if any games have ended (2 consecutive passes)."""
         return self.pass_count >= 2
-    @timed_method
+
     def compute_scores(self) -> Tensor:
         """
         Compute simple territory scores (stone count only).

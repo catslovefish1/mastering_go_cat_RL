@@ -15,7 +15,7 @@ from torch import Tensor
 
 # Avoid circular imports
 if TYPE_CHECKING:
-    from engine.tensor_native_stable_dense import TensorBoard
+    from engine.tensor_native import TensorBoard
 
 # ========================= DEVICE UTILITIES =========================
 
@@ -60,6 +60,21 @@ def coords_to_flat(rows: Tensor, cols: Tensor, width: int) -> Tensor:
     """
     return rows * width + cols
 
+# ========================= POSITION UTILITIES =========================
+
+def create_pass_positions(batch_size: int, device: torch.device) -> Tensor:
+    """Create tensor of pass moves for given batch size.
+    
+    Pass moves are represented as [-1, -1] in the position tensor.
+    
+    Args:
+        batch_size: Number of positions to create
+        device: Target device for tensor creation
+        
+    Returns:
+        Tensor of shape (batch_size, 2) filled with -1
+    """
+    return torch.full((batch_size, 2), -1, dtype=torch.int16, device=device)
 
 
 # ========================= PROBABILITY UTILITIES =========================
@@ -165,56 +180,114 @@ def print_section_header(title: str, width: int = 80) -> None:
     print(title)
     print("=" * width)
 
+def print_union_find_grid(board, batch_idx: int = 0, column: int = 0) -> None:
+    """Print union-find data in grid format
+    column: 0=Colour, 1=Parent, 2=Liberty
+    """
+    column_names = ["Colour", "Parent", "Liberty"]
+    print(f"\n{column_names[column]} values for batch {batch_idx}:")
+    print("-" * (board.board_size * 4 + 1))
+    
+    uf_data = board.flatten_union_find[batch_idx, :, column].view(board.board_size, board.board_size)
+    
+    for row in range(board.board_size):
+        row_str = "|"
+        for col in range(board.board_size):
+            value = uf_data[row, col].item()
+            row_str += f"{value:3}|"
+        print(row_str)
+    print("-" * (board.board_size * 4 + 1))
 
+def print_all_union_find_columns(board, batch_idx: int = 0, board_size_limit: int = 9) -> None:
+    """Print all union-find columns with appropriate formatting."""
+    # Always print colour
+    print("\nCOLOUR (-1=empty, 0=black, 1=white):")
+    print_union_find_grid(board, batch_idx, column=0)
+    
+    # Only print parent/liberty for small boards
+    if board.board_size <= board_size_limit:
+        print("\nPARENT INDICES:")
+        print_union_find_grid(board, batch_idx, column=1)
+        
+        print("\nLIBERTY COUNTS:")
+        print_union_find_grid(board, batch_idx, column=2)
 
+def print_move_info(move: Tensor, player: int) -> None:
+    """Print information about a move."""
+    player_name = "BLACK" if player == 0 else "WHITE"
+    print(f"\nCurrent player: {player_name} ({player})")
+    print(f"Move to be played: {move.tolist()}")
+    
+    if move[0] >= 0:  # Not a pass
+        print(f"  Position: row={move[0].item()}, col={move[1].item()}")
+    else:
+        print("  PASS MOVE")
+
+def print_game_state(board, batch_idx: int = 0, ply: int = 0, 
+                    header: str = "", move: Optional[Tensor] = None) -> None:
+    """Print complete game state for debugging.
+    
+    This is a high-level function that combines multiple printing utilities.
+    """
+    print_section_header(f"{header} - Ply {ply}")
+    
+    # Print move if provided
+    if move is not None:
+        print_move_info(move, board.current_player[batch_idx].item())
+    
+    # Print all union-find columns
+    print_all_union_find_columns(board, batch_idx)
+    
+    # Additional game info
+    print(f"\nPass count: {board.pass_count[batch_idx].item()}")
+    if board.ko_points[batch_idx, 0] >= 0:
+        ko_row = board.ko_points[batch_idx, 0].item()
+        ko_col = board.ko_points[batch_idx, 1].item()
+        print(f"Ko point: ({ko_row}, {ko_col})")
 
 def print_timing_report(board, top_n: int = 30) -> None:
-    """Simplified timing report for board.timings."""
-    import torch
-
-    def human_bytes(n: float) -> str:
-        n = abs(float(n))
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if n < 1024:
-                return f"{n:.2f} {unit}"
-            n /= 1024.0
-        return f"{n:.2f} PB"
-
-    time_rows, mem_rows = [], []
-    timings = getattr(board, "timings", {}) or {}
-
-    for name, values in timings.items():
-        if not values:
-            continue
-        t = torch.tensor(values, dtype=torch.float64)
-        entry = {
-            "name": name,
-            "total": float(t.sum().item()),
-            "mean": float(t.mean().item()),
-            "count": int(t.numel()),
-        }
-        if ":mem" in name:
-            mem_rows.append(entry)
-        else:
-            time_rows.append(entry)
-
-    # Print timing table
-    if time_rows:
-        time_rows = sorted(time_rows, key=lambda r: r["total"], reverse=True)[:top_n]
-        print("\n" + "="*80)
-        print(f"{'Function':<44} {'Total(ms)':>11} {'Avg(ms)':>10} {'Calls':>8}")
-        print("-"*80)
-        for r in time_rows:
-            print(f"{r['name']:<44} {r['total']*1000:>11.2f} {r['mean']*1000:>10.3f} {r['count']:>8}")
-
-    # Print memory table
-    if mem_rows:
-        mem_rows = sorted(mem_rows, key=lambda r: r["total"], reverse=True)[:top_n]
-        print("\n" + "="*80)
-        print(f"{'Function':<44} {'Total':>13} {'Avg':>13} {'Calls':>8}")
-        print("-"*80)
-        for r in mem_rows:
-            print(f"{r['name']:<44} {human_bytes(r['total']):>13} {human_bytes(r['mean']):>13} {r['count']:>8}")
+    """Print detailed timing report with enhanced statistics"""
+    print_section_header("TIMING REPORT")
+    
+    # Convert to tensors for faster operations
+    timing_data = []
+    
+    for func_name, times in board.timings.items():
+        if times:
+            times_tensor = torch.tensor(times, device='cpu')
+            timing_data.append({
+                'name': func_name,
+                'times': times_tensor,
+                'total': times_tensor.sum().item(),
+                'mean': times_tensor.mean().item(),
+                'std': times_tensor.std().item() if len(times) > 1 else 0,
+                'count': len(times),
+                'min': times_tensor.min().item(),
+                'max': times_tensor.max().item(),
+            })
+    
+    # Sort by total time
+    timing_data.sort(key=lambda x: x['total'], reverse=True)
+    
+    # Calculate percentages
+    total_time_all = sum(item['total'] for item in timing_data)
+    
+    # Print enhanced statistics
+    print(f"\nTop {top_n} Time-Consuming Functions:")
+    print(f"{'Function':<40} {'Total(ms)':<12} {'Avg(ms)':<12} {'Count':<10} {'%':<6}")
+    print("-" * 80)
+    
+    for item in timing_data[:top_n]:
+        percent = (item['total'] / total_time_all * 100) if total_time_all > 0 else 0
+        print(f"{item['name']:<40} {item['total']*1000:<12.2f} {item['mean']*1000:<12.4f} "
+              f"{item['count']:<10} {percent:<6.1f}")
+    
+    # Print call counts
+    print(f"\n\nFunction Call Counts:")
+    print(f"{'Function':<40} {'Calls':<10}")
+    print("-" * 50)
+    for func_name, count in sorted(board.call_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"{func_name:<40} {count:<10}")
     
  
 
@@ -227,9 +300,20 @@ def print_performance_metrics(elapsed: float, moves_made: int, num_games: int) -
     print(f"Time per move: {elapsed/moves_made*1000:.2f} ms")
     print(f"Time per game: {elapsed/num_games:.3f} seconds")
 
+def print_game_summary(stats) -> None:
+    """Print game statistics summary."""
+    print(
+        f"\nFinished {stats.total_games} games in {stats.duration_seconds:.2f}s "
+        f"({stats.seconds_per_move:.4f}s/ply)"
+    )
+    print(f"Black wins: {stats.black_wins:4d} ({stats.black_win_rate:6.1%})")
+    print(f"White wins: {stats.white_wins:4d} ({stats.white_win_rate:6.1%})")
+    print(f"Draws     : {stats.draws:4d} ({stats.draw_rate:6.1%})")
+    
 
 import json, os, torch
 
+import json, os, torch
 
 def save_game_histories_to_json(
     boards,

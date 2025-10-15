@@ -3,7 +3,7 @@ Simple test for super-ko implementation.
 """
 
 import torch
-from engine.tensor_native_stable import TensorBoard
+from engine.tensor_native import TensorBoard
 import time
 
 def test_basic_super_ko():

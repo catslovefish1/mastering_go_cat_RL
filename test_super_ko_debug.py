@@ -2,7 +2,7 @@
 from __future__ import annotations
 import torch
 from engine.GoLegalMoveChecker import GoLegalMoveChecker
-from engine.tensor_native_stable import TensorBoard, Stone
+from engine.tensor_native import TensorBoard, Stone
 
 def xor_reduce_1d(vec: torch.Tensor) -> torch.Tensor:
     """Bitwise XOR-reduce a 1D tensor."""

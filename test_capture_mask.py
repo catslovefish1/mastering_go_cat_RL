@@ -3,7 +3,7 @@
 
 import torch
 from engine.GoLegalMoveChecker import GoLegalMoveChecker
-from engine.tensor_native_stable_dense import TensorBoard, Stone
+from engine.tensor_native import TensorBoard, Stone
 
 def test_capture_stone_mask():
     """Test that capture_stone_mask correctly identifies which stones would be captured."""

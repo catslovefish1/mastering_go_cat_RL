@@ -9,7 +9,7 @@ import time
 import torch
 
 # Import engine and agents
-from engine.tensor_native_stable_dense import TensorBoard
+from engine.tensor_native import TensorBoard
 from agents.basic import TensorBatchBot
 from agents.simple_mcts import create_simple_mcts_agent
 from interface.ascii import show

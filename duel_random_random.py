@@ -76,7 +76,7 @@ def simulate_batch_games(
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=2**2,
+        num_games=2**10,
         board_size=19,
         history_factor=1,
         log_interval=2**6,
