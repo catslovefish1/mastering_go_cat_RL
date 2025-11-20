@@ -9,10 +9,44 @@ from collections import defaultdict
 import torch
 from torch import Tensor
 
+
 from contextlib import contextmanager
+
 from functools import wraps
 
+def _mem_alloc_mb(dev: torch.device) -> float:
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+        return torch.cuda.memory_allocated(dev) / (1024**2)
+    if dev.type == "mps" and hasattr(torch, "mps"):
+        return torch.mps.current_allocated_memory() / (1024**2)
+    return 0.0
 
+def _mem_aux_str(dev: torch.device) -> str:
+    if dev.type == "cuda":
+        peak = torch.cuda.max_memory_allocated(dev) / (1024**2)
+        return f"peak={peak:.1f} MB"
+    if dev.type == "mps" and hasattr(torch, "mps"):
+        drv = torch.mps.driver_allocated_memory() / (1024**2)
+        return f"driver={drv:.1f} MB"
+    return ""
+
+def mem_probe(tag: str, min_delta_mb: float = 8.0):
+    """Function decorator: prints net allocation delta if |Δ| >= threshold."""
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            dev = getattr(self, "device", torch.device("cpu"))
+            before = _mem_alloc_mb(dev)
+            out = fn(self, *args, **kwargs)
+            after = _mem_alloc_mb(dev)
+            delta = after - before
+            if abs(delta) >= min_delta_mb:
+                aux = _mem_aux_str(dev)
+                print(f"[MEM][{tag}] delta={delta:+.1f} MB alloc={after:.1f} MB {aux}")
+            return out
+        return wrapper
+    return deco
 
 
 
@@ -45,7 +79,6 @@ BoardTensor    = Tensor   # (B, H, W)
 PositionTensor = Tensor   # (B, 2)
 PassTensor     = Tensor   # (B,)
 
-
 # ========================= GO ENGINE =========================================
 
 class TensorBoard(torch.nn.Module):
@@ -72,8 +105,9 @@ class TensorBoard(torch.nn.Module):
         self.enable_timing   = enable_timing
         self.enable_super_ko = enable_super_ko
         self.debug_place_trace = debug_place_trace
-
-        # Register persistent buffers for repeat computation, for zobrist_hash_history
+        
+        
+        # Register persistent buffers for repeat computation,for zobrish_hash_history
         # These will be allocated once and reused forever
         self.register_buffer('_hist_masked', None, persistent=False)
         self.register_buffer('_hist_sorted', None, persistent=False)
@@ -103,8 +137,6 @@ class TensorBoard(torch.nn.Module):
         self._last_legal_mask: Optional[Tensor] = None
         self._last_info: Optional[Dict] = None
 
-
-
     # ------------------------------------------------------------------ #
     # Zobrist                                                            #
     # ------------------------------------------------------------------ #
@@ -116,17 +148,12 @@ class TensorBoard(torch.nn.Module):
         B = self.batch_size
         H = W = self.board_size
         self.N2 = H * W
-
-        # Capture staging + workspace, allocated once
+       # Do this:
         self._cap_vals = torch.zeros((B, self.N2, 4), dtype=torch.int32, device=self.device)
         self._cap_vals.fill_(0)  # Force write to EVERY element
-
-        # Reuse across calls
-        self._ws_int32 = torch.zeros((4, B, self.N2), dtype=torch.int32, device=self.device)
+        # reuse across calls
+        self._ws_int32 = torch.zeros((4, B, self.N2), dtype=torch.int32, device=self.device)  
         self._ws_int32.fill_(0)  # Force commit all pages
-        
-        # Group XOR workspace for super-ko (size = max possible groups = B * N2)
-        self._group_xor = torch.zeros(B * self.N2, dtype=torch.int32, device=self.device)
 
         # Random values for each position and state: empty(0), black(1), white(2)
         torch.manual_seed(42)  # reproducible profiling
@@ -140,6 +167,22 @@ class TensorBoard(torch.nn.Module):
         # Flattened Zobrist: (N2, 3)
         self.Zpos  = self.zobrist_table.view(self.N2, 3).contiguous()
         self.ZposT = self.Zpos.transpose(0, 1).contiguous()   # (3, N2)
+        
+    def _mem_tick(self, label: str, min_mb: float = 1.0):
+        """Print driver growth since the last tick for this label."""
+
+        cur = torch.mps.driver_allocated_memory() / (1024**2)
+        key = f"_mem_tick_prev_{label}"
+        prev = getattr(self, key, None)
+        setattr(self, key, cur)
+        if prev is None:
+            return
+        delta = cur - prev
+        if delta >= min_mb:
+            alloc = _mem_alloc_mb(self.device)
+            print(f"[MPS][{label}] driver={cur:.1f} MB Δ={delta:+.1f} MB, alloc={alloc:.1f} MB")
+
+        
 
     # ------------------------------------------------------------------ #
     # Mutable state                                                      #
@@ -189,6 +232,7 @@ class TensorBoard(torch.nn.Module):
         self.current_player = self.current_player ^ 1
         self._invalidate_cache()
 
+    
     def _invalidate_cache(self) -> None:
         """Clear cached legal moves and capture info."""
         self._last_legal_mask = None
@@ -196,30 +240,18 @@ class TensorBoard(torch.nn.Module):
 
     # ==================== LEGAL MOVES ======================================= #
 
+
     @timed_method
+    @mem_probe("legal_moves") 
     def legal_moves(self) -> BoardTensor:
-        if self.device.type == "mps" and hasattr(torch, "mps"):
-            drv_before = torch.mps.driver_allocated_memory() / (1024**2)
-        else:
-            drv_before = None
-
         if self._last_legal_mask is None:
-            legal_mask, info = self._compute_legal_core()
 
-            if self.enable_super_ko:
-                if self.device.type == "mps" and hasattr(torch, "mps"):
-                    drv_mid = torch.mps.driver_allocated_memory() / (1024**2)
-                    print(f"[MPS][legal_moves] before_filter={drv_before:.1f} MB, "
-                        f"after_core={drv_mid:.1f} MB")
+                legal_mask, info = self._compute_legal_core()
+
+        if self.enable_super_ko:
                 legal_mask = self._filter_super_ko_vectorized(legal_mask, info)
-
-            self._last_legal_mask = legal_mask
-            self._last_info = info
-
-        if self.device.type == "mps" and hasattr(torch, "mps"):
-            drv_after = torch.mps.driver_allocated_memory() / (1024**2)
-            print(f"[MPS][legal_moves] after_full={drv_after:.1f} MB")
-
+        self._last_legal_mask = legal_mask
+        self._last_info = info
         return self._last_legal_mask
 
 
@@ -232,150 +264,183 @@ class TensorBoard(torch.nn.Module):
             return_info=True,
         )
 
-    # ======= Super-ko via CSR (no BxN2xN2 tensors) ========================== #
 
+
+    # ======= Super-ko via CSR (no BxN2xN2 tensors) ============================ #
+    # @timed_method
+    # @mem_probe("_filter_super_ko_vectorized")
+    # def _filter_super_ko_vectorized(self, legal_mask: BoardTensor, info: Dict) -> BoardTensor:
+    #     device = self.device
+    #     B, H, W = legal_mask.shape
+    #     N2 = H * W
+
+    #     # --- Placement delta (EMPTY -> player) ---
+    #     player = self.current_player.long()                   # (B,)
+    #     z_empty = self.ZposT[0]                               # (N2,)  int32
+    #     z_by_color = self.ZposT[1:3]                          # (2,N2) int32
+    #     z_place = z_by_color[player]                          # (B,N2) int32
+    #     place_delta = z_empty ^ z_place                       # (B,N2) int32
+
+    #     # ---------- CSR (indices must be long) ----------
+    #     members = info["stone_global_index"].long()           # (K,)
+    #     indptr  = info["stone_global_pointer"].long()         # (R+1,)
+    #     gptr    = info["group_global_pointer_per_board"].long()  # (B+1,)
+    #     cap_local = info["captured_group_local_index"].long() # (B,N2,4)
+
+    #     R = int(indptr.numel() - 1)
+    #     K = int(members.numel())
+
+    #     # ===== Fast path =====
+    #     if R == 0 or K == 0:
+    #         info["group_xor_remove_delta"] = torch.zeros(0, dtype=torch.int32, device=device)
+    #         cap_delta = torch.zeros(B, N2, dtype=torch.int32, device=device)
+    #         new_hash = (self.current_hash[:, None] ^ place_delta ^ cap_delta)
+    #         repeat_mask = self._repeat_mask_from_history(new_hash, legal_mask)
+    #         return legal_mask & ~repeat_mask
+
+    #     # ===== Map group rows to boards; stones to groups and boards =====
+    #     groups_per_board = (gptr[1:] - gptr[:-1]).long()      # (B,)
+    #     group_board = torch.repeat_interleave(
+    #         torch.arange(B, device=device, dtype=torch.long),
+    #         groups_per_board
+    #     )                                                     # (R,)
+
+    #     group_len = (indptr[1:] - indptr[:-1]).long()         # (R,)
+    #     g_of_stone = torch.repeat_interleave(
+    #         torch.arange(R, device=device, dtype=torch.long),
+    #         group_len
+    #     )                                                     # (K,)
+    #     stone_board = group_board[g_of_stone]                 # (K,)
+
+    #     # ===== Per-stone removal delta without (B,N2) table =====
+    #     opp = (1 - player).long()                             # (B,)
+    #     opp_for_stone = opp[stone_board]                      # (K,) in {0,1}
+    #     z_opp = z_by_color[opp_for_stone, members]            # (K,)  int32
+    #     z_emp = z_empty[members]                              # (K,)  int32
+    #     per_stone = (z_opp ^ z_emp).to(torch.int32)           # (K,)  int32
+
+    #     # ===== XOR-reduce per group via padded tree reduction (fast, compact) =====
+    #     Lmax = int(group_len.max().item())
+    #     pad = torch.zeros(R, Lmax, dtype=torch.int32, device=device)  # (R,Lmax)
+    #     idxK = torch.arange(K, device=device, dtype=torch.long)
+    #     start = indptr[:-1][g_of_stone]                                # (K,)
+    #     pos   = idxK - start                                          # (K,)
+    #     pad[g_of_stone, pos] = per_stone
+
+    #     width, acc = Lmax, pad
+    #     while width > 1:
+    #         half = width // 2
+    #         acc = acc[:, :half] ^ acc[:, half:half*2]
+    #         if width & 1:
+    #             acc = acc ^ acc[:, -1:]
+    #         width = acc.size(1)
+    #     group_xor = acc.squeeze(1).contiguous()                        # (R,) int32
+
+    #     # ===== Candidate capture: `(B,N2,4)` staging (kept to avoid loops) =====
+    #     valid = (cap_local >= 0)                                       # (B,N2,4) bool
+    #     base = gptr[:-1].view(B, 1, 1)                                 # (B,1,1)
+    #     g_global = (base + cap_local.clamp_min(0)).view(-1)            # (B*N2*4,) long
+
+    #     cap_vals = torch.zeros(B, N2, 4, dtype=torch.int32, device=device)  # (B,N2,4)
+    #     flat_valid = valid.view(-1)
+    #     cap_vals.view(-1)[flat_valid] = group_xor[g_global[flat_valid]]
+    #     cap_delta = cap_vals[..., 0] ^ cap_vals[..., 1] ^ cap_vals[..., 2] ^ cap_vals[..., 3]  # (B,N2)
+
+    #     # ===== Super-ko filter =====
+    #     new_hash = (self.current_hash[:, None] ^ place_delta ^ cap_delta)  # (B,N2) int32
+    #     repeat_mask = self._repeat_mask_from_history(new_hash, legal_mask)
+
+    #     # Save per-group removal deltas for placement
+    #     info["group_xor_remove_delta"] = group_xor
+
+    #     return legal_mask & ~repeat_mask
+    
+    
+    
     @timed_method
-    @torch.no_grad()
+    @mem_probe("_filter_super_ko_vectorized")
     def _filter_super_ko_vectorized(self, legal_mask: BoardTensor, info: Dict) -> BoardTensor:
         device = self.device
         B, H, W = legal_mask.shape
         N2 = H * W
 
-        # ===== Fixed workspaces (allocated once in _init_zobrist_tables) ==========
+        # 0) function entry: seed/print only if we crossed threshold since last time
+
+
+        # ===== Allocate ONE workspace (likely to hit new buckets early on) =====
         workspace   = self._ws_int32
-        place_delta = workspace[0].view(B, N2)   # (B,N2) int32
-        cap_delta   = workspace[1].view(B, N2)   # (B,N2) int32
-        new_hash    = workspace[2].view(B, N2)   # (B,N2) int32
-        # temp_work = workspace[3].view(B, N2)   # reserved for future use
+        place_delta = workspace[0]
+        cap_delta   = workspace[1]
+        new_hash    = workspace[2]
+        temp_work   = workspace[3]
 
-        cap_vals    = self._cap_vals            # (B,N2,4) int32
-        group_xor_ws = self._group_xor          # (B*N2,) int32 – we'll slice [:R]
+        # 1) after big (B,N2) workspace allocation
 
-        is_mps = (device.type == "mps" and hasattr(torch, "mps"))
-        if is_mps:
-            drv0 = torch.mps.driver_allocated_memory() / (1024**2)
-            print(
-                f"[MPS][sko] start={drv0:.1f} MB "
-                f"ws_ptr={workspace.data_ptr()} "
-                f"cap_ptr={cap_vals.data_ptr()} "
-                f"gx_ptr={group_xor_ws.data_ptr()} "
-                f"hist_ptr={self.hash_history.data_ptr()}"
-            )
-
-        # ------------------------------------------------------------------ #
-        # 1) Per-move placement delta (Zobrist) – fully reused (B,N2)        #
-        # ------------------------------------------------------------------ #
-        # For each board b, each cell i:
-        #   delta_place[b, i] = Z(empty, i) ^ Z(player[b], i)
-        player  = self.current_player.long()    # (B,)
-        z_empty = self.ZposT[0]                 # (N2,)
-        z_black = self.ZposT[1]                 # (N2,)
-        z_white = self.ZposT[2]                 # (N2,)
-
-        place_delta.zero_()
-        place_delta += z_empty.view(1, N2)      # broadcast to (B,N2)
-
-        mask_black = (player == 0)
-        mask_white = ~mask_black
-        if mask_black.any():
-            place_delta[mask_black] ^= z_black.view(1, N2)
-        if mask_white.any():
-            place_delta[mask_white] ^= z_white.view(1, N2)
-
-        # ------------------------------------------------------------------ #
-        # 2) CSR pieces & stats                                              #
-        # ------------------------------------------------------------------ #
-        members   = info["stone_global_index"].long()              # (K,)
-        indptr    = info["stone_global_pointer"].long()            # (R+1,)
-        gptr      = info["group_global_pointer_per_board"].long()  # (B+1,)
-        cap_local = info["captured_group_local_index"].long()      # (B,N2,4)
+        # ---- CSR pieces & stats ----
+        members = info["stone_global_index"].long()
+        indptr  = info["stone_global_pointer"].long()
+        gptr    = info["group_global_pointer_per_board"].long()
+        cap_local = info["captured_group_local_index"].long()
 
         R = int(indptr.numel() - 1)
         K = int(members.numel())
-        Lmax = int((indptr[1:] - indptr[:-1]).max().item()) if R > 0 else 0
+        Lmax = int((indptr[1:] - indptr[:-1]).max().item())
         print(f"[STATS] K={K} R={R} Lmax={Lmax}")
 
-        # Early exit: no groups / no stones → only placement delta matters.
+        # 2) after CSR introspection (shapes can steer later temps)
+
         if R == 0 or K == 0:
-            if is_mps:
-                drv1 = torch.mps.driver_allocated_memory() / (1024**2)
-                print(f"[MPS][sko] trivial_case={drv1:.1f} MB")
-
-            # No group_xor (empty view)
-            info["group_xor_remove_delta"] = group_xor_ws[:0]
-
+            info["group_xor_remove_delta"] = torch.zeros(0, dtype=torch.int32, device=device)
             cap_delta.zero_()
-            # new_hash = current_hash ^ place_delta  (no captures)
-            new_hash.copy_(self.current_hash.view(B, 1))
-            new_hash ^= place_delta
-
+            torch.bitwise_xor(self.current_hash[:, None], place_delta, out=new_hash)
+            torch.bitwise_xor(new_hash, cap_delta, out=new_hash)
             repeat_mask = self._repeat_mask_from_history(new_hash, legal_mask)
             return legal_mask & ~repeat_mask
 
-        if is_mps:
-            drv2 = torch.mps.driver_allocated_memory() / (1024**2)
-            print(f"[MPS][sko] after_CSR_views={drv2:.1f} MB")
+        # ---- map stone -> board, per-stone toggle ----
+        player = self.current_player.long()
+        z_empty = self.ZposT[0]
+        z_by_color = self.ZposT[1:3]
 
-        # ------------------------------------------------------------------ #
-        # 3) Per-stone toggle for captures (stone -> board)                  #
-        # ------------------------------------------------------------------ #
-        z_empty  = self.ZposT[0]          # (N2,)
-        z_by_col = self.ZposT[1:3]        # (2,N2)
+        groups_per_board = (gptr[1:] - gptr[:-1]).long()
+        group_board = torch.repeat_interleave(torch.arange(B, device=device, dtype=torch.long), groups_per_board)
+        group_len = (indptr[1:] - indptr[:-1]).long()
+        g_of_stone = torch.repeat_interleave(torch.arange(R, device=device, dtype=torch.long), group_len)
+        stone_board = group_board[g_of_stone]
+        opp = (1 - player).long()
+        opp_for_stone = opp[stone_board]
+        z_opp = z_by_color[opp_for_stone, members]
+        z_emp = z_empty[members]
+        per_stone = (z_opp ^ z_emp).to(torch.int32)
 
-        groups_per_board = (gptr[1:] - gptr[:-1]).long()  # (B,)
-        group_board = torch.repeat_interleave(
-            torch.arange(B, device=device, dtype=torch.long),
-            groups_per_board
-        )  # (R,)
+        # 4) after per-stone vector creation (K-sized bucket)
 
-        group_len = (indptr[1:] - indptr[:-1]).long()     # (R,)
+        # ---- bounded-memory group XOR (tiled) ----
+        starts = indptr[:-1]
+        lens   = group_len
+        group_xor = torch.zeros(R, dtype=torch.int32, device=device)
 
-        g_of_stone = torch.repeat_interleave(
-            torch.arange(R, device=device, dtype=torch.long),
-            group_len
-        )  # (K,)
-
-        stone_board   = group_board[g_of_stone]          # (K,)
-        opp           = (1 - player).long()              # (B,)
-        opp_for_stone = opp[stone_board]                 # (K,)
-        z_opp         = z_by_col[opp_for_stone, members] # (K,)
-        z_emp         = z_empty[members]                 # (K,)
-        per_stone     = (z_opp ^ z_emp).to(torch.int32)  # (K,)
-
-        if is_mps:
-            drv3 = torch.mps.driver_allocated_memory() / (1024**2)
-            print(f"[MPS][sko] after_per_stone={drv3:.1f} MB")
-
-        # ------------------------------------------------------------------ #
-        # 4) Bounded-memory group XOR (tiled)                                #
-        # ------------------------------------------------------------------ #
-        starts = indptr[:-1]            # (R,)
-        lens   = group_len              # (R,)
-
-        # Reuse group_xor workspace: prefix of size R
-        group_xor = group_xor_ws[:R]
-        group_xor.zero_()
-
-        R_TILE = 2**12   # 4096 groups per tile
-        W_TILE = 2**2    # 4 elements per reduction chunk
+        R_TILE = 2**10
+        W_TILE = 2**4
         offs_w = torch.arange(W_TILE, device=device, dtype=torch.long)
 
         if int(lens.max().item()) > 0:
             for r0 in range(0, R, R_TILE):
                 r1 = min(r0 + R_TILE, R)
-                s_seg = starts[r0:r1]   # (Rt,)
-                n_seg = lens[r0:r1]     # (Rt,)
+                s_seg = starts[r0:r1]
+                n_seg = lens[r0:r1]
                 if int(n_seg.max().item()) == 0:
                     continue
 
                 max_len = int(n_seg.max().item())
                 for p in range(0, max_len, W_TILE):
-                    rel   = p + offs_w                        # (W_TILE,)
-                    valid = rel[None, :] < n_seg[:, None]     # (Rt,W_TILE) bool
-                    idx   = s_seg[:, None] + rel[None, :]     # (Rt,W_TILE)
-                    vals  = per_stone[idx.clamp_max(per_stone.numel() - 1)]  # (Rt,W_TILE)
+                    rel   = p + offs_w
+                    valid = rel[None, :] < n_seg[:, None]
+                    idx   = s_seg[:, None] + rel[None, :]
+                    vals  = per_stone[idx.clamp_max(per_stone.numel() - 1)]
                     vals  = torch.where(valid, vals, vals.new_zeros(()))
 
+                    # reduction (alloc-free pattern unchanged here; just measuring growth)
                     acc = vals
                     width = acc.size(1)
                     while width > 1:
@@ -384,98 +449,182 @@ class TensorBoard(torch.nn.Module):
                         if width & 1:
                             acc = acc ^ acc[:, -1:]
                         width = acc.size(1)
-
                     group_xor[r0:r1] ^= acc.squeeze(1)
 
-        if is_mps:
-            drv4 = torch.mps.driver_allocated_memory() / (1024**2)
-            print(f"[MPS][sko] after_group_xor={drv4:.1f} MB")
+        # 5) after group XOR (this is where width/shape churn tends to grow driver)
 
-        # ------------------------------------------------------------------ #
-        # 5) Candidate capture (B,N2,4) staging – reuse _cap_vals            #
-        # ------------------------------------------------------------------ #
-        valid = (cap_local >= 0)                       # (B,N2,4) bool
+        # ---- candidate capture (B,N2,4) staging ----
+        valid = (cap_local >= 0)
+        nnz = int(valid.sum().item())
+        print(f"[STATS][cap] nnz_valid={nnz} / total={valid.numel()} ({100.0*nnz/valid.numel():.2f}%)")
 
-        # base is (B+1,), each board's group offset
-        base = gptr[:-1].view(B, 1, 1)                 # (B,1,1) int64
+        # Estimate how many *elements* we’ll scatter this ply per neighbor (cheap)
+        per_k = [int(valid[..., k].sum().item()) for k in range(4)]
+        print(f"[STATS][cap] per-neighbor nnz: {per_k} total={sum(per_k)}")
 
-        # 1) Build global group ids in-place: g_global_full = base + cap_local_clamped
-        cap_vals.copy_(cap_local.clamp_min(0))         # (B,N2,4) local ids
-        cap_vals.add_(base)                            # now global group ids
+        base  = gptr[:-1].view(B, 1, 1)
+        g_global = (base + cap_local.clamp_min(0)).view(-1)
 
-        # 2) Map global group ids -> per-group XOR deltas, in-place
-        if group_xor.numel() and valid.any():
-            flat_idx = cap_vals[valid].to(torch.long)  # (K',) global group ids
-            cap_vals.zero_()
-            cap_vals[valid] = group_xor[flat_idx]      # per-group deltas
-        else:
-            cap_vals.zero_()
+        # ---- Probe: ZERO phase ----
+        cap_vals = self._cap_vals
+        cap_vals.zero_()  # ADD THIS BACK - needed for correctness!
 
-        # 3) Reduce over 4 neighbours -> single delta per candidate cell, in-place
-        cap_delta.zero_()
-        cap_delta.copy_(cap_vals[..., 0])
-        cap_delta ^= cap_vals[..., 1]
-        cap_delta ^= cap_vals[..., 2]
-        cap_delta ^= cap_vals[..., 3]
+        # ---- Probe: SCATTER phase (do neighbor-by-neighbor) ----
 
-        if is_mps:
-            drv5 = torch.mps.driver_allocated_memory() / (1024**2)
-            print(f"[MPS][sko] after_cap_stage={drv5:.1f} MB")
+        for k in range(4):
+            mask_k = valid[..., k].view(-1)          # (B*N2,)
+            if mask_k.any():
+                # pick the k-th neighbor channel for g and for cap_vals
+                gk = g_global.view(B, N2, 4)[..., k].view(-1)      # (B*N2,)
+                # write only within the k-channel slice of cap_vals
+                cap_slice = cap_vals.view(B, N2, 4)[..., k].view(-1)  # (B*N2,)
+                cap_slice[mask_k] = group_xor[gk[mask_k]]
 
-        # ------------------------------------------------------------------ #
-        # 6) Finalize hashes + repeat filter                                 #
-        # ------------------------------------------------------------------ #
-        # new_hash[b, i] = current_hash[b] ^ place_delta[b, i] ^ cap_delta[b, i]
-        new_hash.copy_(self.current_hash.view(B, 1))
-        new_hash ^= place_delta
-        new_hash ^= cap_delta
+
+        # Reduce to cap_delta (unchanged)
+        cap_delta = cap_vals[..., 0] ^ cap_vals[..., 1] ^ cap_vals[..., 2] ^ cap_vals[..., 3]
+
+
+
+        # 6) after (B,N2,4) staging — typically the biggest single allocation here
+
+        # ---- finalize hashes + repeat filter ----
+        new_hash = (self.current_hash[:, None] ^ place_delta ^ cap_delta)
+        repeat_mask = self._repeat_mask_from_history(new_hash, legal_mask)
+        # 7) after computing new_hash & calling repeat check (may allocate tiles)
 
         info["group_xor_remove_delta"] = group_xor
-
-        repeat_mask = self._repeat_mask_from_history(new_hash, legal_mask)
-
-        if is_mps:
-            drv6 = torch.mps.driver_allocated_memory() / (1024**2)
-            print(f"[MPS][sko] end={drv6:.1f} MB")
-
         return legal_mask & ~repeat_mask
 
 
 
+
+    @mem_probe("repeat: fake, quick test, only the shape kept)")
+    def _repeat_mask_from_history(self, new_hash: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
+        # ... original expensive path below ...
+        B, H, W = legal_mask.shape   # (B, N2) bool
+        return legal_mask.view(B, H, W)
+        
+
+    
+        
+    # @mem_probe("repeat: sort/search (B,M)")
+    # def _repeat_mask_from_history(self, new_hash: Tensor, legal_mask: Tensor) -> Tensor:
+    #     dev = self.device
+    #     B, H, W = legal_mask.shape
+    #     N2 = H * W
+
+    #     hist: Tensor = self.hash_history
+    #     M = hist.shape[1]
+    #     if M == 0:
+    #         return torch.zeros_like(legal_mask, dtype=torch.bool)
+
+    #     # Keep int32 to avoid upcasts
+    #     L = self.move_count.clamp_max(M).to(torch.int32)  # (B,)
+
+    #     # ---------- ensure persistent buffers ----------
+    #     if (self._hist_masked is None) or (self._hist_masked.shape != hist.shape):
+    #         self._hist_masked = torch.empty_like(hist)                  # (B,M) int32
+    #     if (self._hist_sorted is None) or (self._hist_sorted.shape != hist.shape):
+    #         self._hist_sorted = torch.empty_like(hist)                  # (B,M) int32
+    #     if (self._sort_indices is None) or (self._sort_indices.shape != hist.shape):
+    #         self._sort_indices = torch.empty(hist.shape, dtype=torch.int64, device=dev)  # (B,M)
+
+    #     if (self._search_idx is None) or (self._search_idx.shape != (B, N2)):
+    #         self._search_idx = torch.empty((B, N2), dtype=torch.int64, device=dev)       # (B,N2)
+    #     if (self._gathered_val is None) or (self._gathered_val.shape != (B, N2)):
+    #         self._gathered_val = torch.empty((B, N2), dtype=torch.int32, device=dev)     # (B,N2)
+    #     if (self._is_repeat_buffer is None) or (self._is_repeat_buffer.shape != (B, N2)):
+    #         self._is_repeat_buffer = torch.empty((B, N2), dtype=torch.bool, device=dev)  # (B,N2)
+
+    #     # NEW: preallocate helpers to avoid per-call temps
+    #     if getattr(self, "_arange_M", None) is None or self._arange_M.numel() != M:
+    #         self._arange_M = torch.arange(M, device=dev, dtype=torch.int32).view(1, -1)  # (1,M)
+    #     if getattr(self, "_valid_mask", None) is None or self._valid_mask.shape != (B, M):
+    #         self._valid_mask = torch.empty((B, M), dtype=torch.bool, device=dev)         # (B,M)
+
+    #     # ---------- mask invalid history in-place (no torch.where alloc) ----------
+    #     INT32_MIN = torch.iinfo(torch.int32).min
+    #     # valid = (ar < L.view(-1,1)) into preallocated _valid_mask
+    #     torch.lt(self._arange_M, L.view(-1, 1), out=self._valid_mask)      # (B,M) bool in-place
+    #     self._hist_masked.copy_(hist)                                      # (B,M)
+    #     self._hist_masked.masked_fill_(~self._valid_mask, INT32_MIN)       # in-place
+
+    #     # ---------- sort with out= (writes into prealloc) ----------
+    #     torch.sort(self._hist_masked, dim=1, out=(self._hist_sorted, self._sort_indices))
+
+    #     # ---------- searchsorted (chunked) to cap temp size ----------
+    #     # MPS has no out= for searchsorted; chunk across N2 so temp never grows beyond (B, T)
+    #     T = 64  # tile width across the N2 dimension; tune 32..256
+    #     Lm1 = (L - 1).clamp_min(0).to(torch.int64).view(B, 1)
+    #     for t in range(0, N2, T):
+    #         u = min(t + T, N2)
+    #         nh_tile = new_hash[:, t:u]                                     # (B, n) view
+    #         idx_tile = torch.searchsorted(self._hist_sorted, nh_tile, right=True)  # NEW (B, n) int64
+    #         idx_tile.add_(-1).clamp_min_(0)
+    #         # cap per-board by L-1
+    #         torch.minimum(idx_tile, Lm1.expand(-1, idx_tile.size(1)), out=idx_tile)
+    #         # write into the big prealloc index buffer
+    #         self._search_idx[:, t:u].copy_(idx_tile)
+
+    #     # ---------- gather & compare into prealloc ----------
+    #     self._gathered_val.copy_(self._hist_sorted.gather(1, self._search_idx))    # (B,N2) int32
+    #     self._is_repeat_buffer.copy_(self._gathered_val == new_hash)               # (B,N2) bool
+
+    #     # ---------- apply legal IN-PLACE (avoid allocating result) ----------
+    #     legal_flat = legal_mask.view(B, N2)
+    #     torch.logical_and(self._is_repeat_buffer, legal_flat, out=self._is_repeat_buffer)
+
+    #     # Return a view of the preallocated buffer (no new alloc)
+    #     return self._is_repeat_buffer.view(B, H, W)
+
+
+
+    
     # --------- shared helper: history repeat mask (deduped) ------------------ #
-    @torch.no_grad()
+    @mem_probe("repeat: sort/search (B,M)")
     def _repeat_mask_from_history(self, new_hash: Tensor, legal_mask: Tensor) -> Tensor:
         """
         new_hash: (B, N2) int32 candidate future hashes
         legal_mask: (B, H, W) bool
         returns: (B, H, W) bool mask where moves repeat a prior hash
         """
-
         B, H, W = legal_mask.shape
         M = self.hash_history.shape[1]
         hist = self.hash_history                                   # (B, M) int32
-        L = self.move_count.clamp_max(M).long()                    # (B,)
+        L = self.move_count.clamp_max(M).long()                     # (B,)
+
+        # --- debug (no-sync) ---
+        if getattr(self, "debug_repeat_shapes", True):
+            print(f"[repeat] new_hash   shape={tuple(new_hash.shape)} dtype={new_hash.dtype} device={new_hash.device}")
+            print(f"[repeat] history    shape={tuple(hist.shape)} dtype={hist.dtype} device={hist.device}")
+            print(f"[repeat] legal_mask shape={tuple(legal_mask.shape)} dtype={legal_mask.dtype} device={legal_mask.device}")
+            # (Avoid reductions like .max()/.sum() here to prevent syncs.)
 
         INT32_MIN = torch.iinfo(torch.int32).min
-        ar = torch.arange(M, device=self.device).view(1, -1)       # (1, M)
-        valid = (ar < L.view(-1, 1))                               # (B, M) bool
-            # Mask invalid columns with a sentinel that cannot equal any real hash
+        ar = torch.arange(M, device=self.device).view(1, -1)        # (1, M)
+        valid = (ar < L.view(-1, 1))                                # (B, M) bool
+
+        # Mask invalid columns with a sentinel that cannot equal any real hash
         hist_masked = torch.where(valid, hist, torch.full_like(hist, INT32_MIN))
-        hist_sorted, _ = torch.sort(hist_masked, dim=1)            # (B, M)
+        self._mem_tick("repeat:before_hist_sorted")
+        hist_sorted, _ = torch.sort(hist_masked, dim=1)             # (B, M)
+        self._mem_tick("repeat:after_hist_sorted")
 
         # Binary search; if not present, 'val' will be != new_hash
         idx = torch.searchsorted(hist_sorted, new_hash, right=True) - 1  # (B, N2) int64
         idx = idx.clamp_min(0)
-        val = hist_sorted.gather(1, idx)                           # (B, N2) int32
+        val = hist_sorted.gather(1, idx)                               # (B, N2) int32
 
-        is_repeat_flat = (val == new_hash)                          # (B, N2) bool
+        is_repeat_flat = (val == new_hash)                              # (B, N2) bool
         return is_repeat_flat.view(B, H, W)
-      
+    
+    
 
-    # ------------------------------------------------------------------ #
-    # Placement & captures                                               #
-    # ------------------------------------------------------------------ #
+
+    
     @timed_method
+    @mem_probe("_place_stones")
     def _place_stones(self, positions: PositionTensor) -> None:
         """
         Vectorized stone placement & capture using CSR.
@@ -505,6 +654,7 @@ class TensorBoard(torch.nn.Module):
         grp_xor  = info["group_xor_remove_delta"].to(torch.int32)       # (R,)     int32
 
         # ---- Incremental Zobrist hash update: placement + captures ----
+        # placement delta at (rows, cols): EMPTY -> ply
         Zpos = self.Zpos                                                # (N2,3) int32
         place_delta = Zpos[lin, 0] ^ Zpos[lin, (ply + 1)]               # (M,)   int32
 
@@ -521,6 +671,7 @@ class TensorBoard(torch.nn.Module):
         self.current_hash[b_idx] ^= (place_delta ^ cap_delta)
 
         # ---- Apply captures: clear stones in captured groups ----
+        # Build one flat list of captured groups (length L <= 4*M)
         flat_valid = valid4.view(-1)
         if flat_valid.any():
             g_list = g_global4.view(-1)[flat_valid]                     # (L,)
@@ -535,17 +686,20 @@ class TensorBoard(torch.nn.Module):
 
             S = int(lens.sum().item())
             if S > 0:
-                g_of_stone = torch.repeat_interleave(
+                # expand per-group into per-stone membership indices
+                g_of_stone   = torch.repeat_interleave(
                     torch.arange(g_list.numel(), device=dev, dtype=torch.long), lens
                 )                                                       # (S,)
                 start_for_stone = starts[g_of_stone]                    # (S,)
+                # position within each group (0..len-1)
                 prefix = torch.cumsum(torch.nn.functional.pad(lens, (1, 0)), 0)[:-1]  # (L,)
                 pos_in_group = torch.arange(S, device=dev, dtype=torch.long) - prefix[g_of_stone]
 
                 member_idx   = start_for_stone + pos_in_group           # (S,)
-                captured_lin = members[member_idx]                      # (S,)
+                captured_lin = members[member_idx]                      # (S,) linear cell ids 0..N2-1
                 board_of_stone = torch.repeat_interleave(board_of_group, lens)        # (S,)
 
+                # Scatter EMPTY in one shot
                 flat_all = self.board.view(-1)                          # (B*N2,)
                 lin_board_cell = board_of_stone * N2 + captured_lin     # (S,)
                 flat_all[lin_board_cell] = torch.tensor(
@@ -554,6 +708,7 @@ class TensorBoard(torch.nn.Module):
 
         # ---- Finally, place the new stones ----
         self.board[b_idx, rows, cols] = ply.to(self.board.dtype)
+
 
     # ------------------------------------------------------------------ #
     # History                                                            #
@@ -574,7 +729,6 @@ class TensorBoard(torch.nn.Module):
 
         # Per-board move index
         move_idx = self.move_count.long()  # (B,)
-
         # Valid if within max_moves (debug snapshots)
         if max_moves > 0:
             valid_mask = (move_idx < max_moves)
@@ -627,6 +781,7 @@ class TensorBoard(torch.nn.Module):
         active   = ~finished
 
         # Record history BEFORE the move
+
         self._update_board_history()
         self.move_count += 1
 
@@ -647,16 +802,7 @@ class TensorBoard(torch.nn.Module):
 
         # Switch to next player
         self.switch_player()
-
-        # --- ONE MPS driver printer per step ---
-        if self.device.type == "mps" and hasattr(torch, "mps"):
-            cur = torch.mps.current_allocated_memory() / (1024**2)
-            drv = torch.mps.driver_allocated_memory() / (1024**2)
-            print(f"[MPS][step] current={cur:.1f} MB driver={drv:.1f} MB")
-
-        # You still call empty_cache here; this doesn't shrink driver, just cache.
-        if self.device.type == "mps" and hasattr(torch, "mps"):
-            torch.mps.empty_cache()
+        torch.mps.empty_cache()
 
     # ------------------------------------------------------------------ #
     # Game state                                                         #
@@ -685,4 +831,3 @@ class TensorBoard(torch.nn.Module):
         """Print timing statistics if timing is enabled."""
         if self.enable_timing:
             print_timing_report(self, top_n)
-# ========================= END OF FILE ===================================== #
